@@ -686,7 +686,7 @@ fn validate_text(text: &str) -> anyhow::Result<()> {
 /// dropped entries.
 const CAP_NOTICE_PREFIX: &str = "- (+";
 
-pub(crate) fn parse(text: &str) -> anyhow::Result<Store> {
+fn parse(text: &str) -> anyhow::Result<Store> {
     let mut store = Store::default();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let (key, value) = line
