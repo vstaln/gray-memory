@@ -1,4 +1,13 @@
-# gray-memory
+<p align="center">
+  <img src="assets/gray-logo.svg" alt="gray" width="96">
+</p>
+<h1 align="center">gray-memory</h1>
+<p align="center">Curated cross-session memory for the gray agent.</p>
+<p align="center">
+  <a href="https://github.com/vstaln/gray-memory/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
+  <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
+</p>
 
 Curated cross-session memory for [gray](https://github.com/vstaln/gray),
 as a sidecar plugin (wire v1.1). Extracted from gray core — same store,
@@ -42,9 +51,11 @@ and `gray memory` forwarding in one shot.
 
 ## Notes
 
-- `src/store.rs` is a verbatim port of the deleted
-  `crates/gray/src/memory.rs`; `src/redact.rs` is the disclosure half of
-  `crates/gray-core/src/redaction.rs` (itself vendored from
-  Hmbown/CodeWhale, MIT — see `THIRD_PARTY_NOTICES.md` in the gray repo).
+- `src/redact.rs` includes third-party MIT-licensed code — see `NOTICE.md`.
 - No `host/*` capabilities: the plugin reads and writes only its own
   directory under `GRAY_HOME`.
+
+---
+
+Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —
+the open-source AI agent harness. <https://gray.alignment.id>

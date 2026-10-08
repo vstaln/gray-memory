@@ -1,7 +1,7 @@
 // Vendored from gray `crates/gray-core/src/redaction.rs` (itself vendored from
 // Hmbown/CodeWhale, MIT) — disclosure half only: the message/log scrubbers that
 // needed `gray_core::message` stayed behind.
-// Copyright (c) 2024-2025 DeepSeek CLI Contributors. See THIRD_PARTY_NOTICES.md.
+// Copyright (c) 2024-2025 DeepSeek CLI Contributors. See NOTICE.md.
 //! Redaction for anything that can reach a log, a span, or a durable receipt.
 //!
 //! Two classes of content are stripped before text is allowed to leave the

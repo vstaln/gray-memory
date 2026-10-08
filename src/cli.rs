@@ -1,5 +1,5 @@
-//! The `gray memory <args>` surface, ported from the deleted
-//! `crates/gray/src/memory.rs` CLI block. Reached two ways: `gray memory …`
+//! The `gray memory <args>` surface — the store CLI that used to live in
+//! gray core's `crates/gray/src/memory.rs`. Reached two ways: `gray memory …`
 //! (the host `exec`s this binary with the args) and `/memory …` inside a
 //! session (the host routes argv over `command/run`). Both land here;
 //! [`run`] returns the text instead of printing so the sidecar can wrap it.
