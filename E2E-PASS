@@ -1,0 +1,1 @@
+memory: hooks (prompt/context frozen/policy/toggle) ✓ · commands (/memory set/show/list/edit/remove/clear/audit/ingest/on/off) ✓ · state (~/.gray/memory/*.md, snapshots, enabled) ✓ · CLI (manifest, set, show, list, remove) ✓
