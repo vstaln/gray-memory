@@ -53,7 +53,9 @@ and `gray memory` forwarding in one shot.
 
 - `src/redact.rs` includes third-party MIT-licensed code — see `NOTICE.md`.
 - No `host/*` capabilities: the plugin reads and writes only its own
-  directory under `GRAY_HOME`.
+  directory under the universal memory home: `GRAY_MEMORY_HOME`, else
+  `GRAY_USER_HOME`, else `~/.gray` — never the per-process `GRAY_HOME`, so
+  gateway conversations, sandboxes and handoffs all share one store.
 
 ---
 

@@ -129,7 +129,7 @@ fn command_run(home: &Path, params: &serde_json::Value) -> serde_json::Value {
 }
 
 fn sidecar_loop() -> anyhow::Result<()> {
-    let home = gray_memory::gray_home()?;
+    let home = gray_memory::memory_home()?;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -148,9 +148,13 @@ fn sidecar_loop() -> anyhow::Result<()> {
         let params = v.get("params").cloned().unwrap_or(serde_json::Value::Null);
         let reply = match method {
             "plugin/manifest" => serde_json::json!({ "id": id, "result": manifest() }),
-            "prompt/context" => serde_json::json!({ "id": id, "result": prompt_context(&home, &params) }),
+            "prompt/context" => {
+                serde_json::json!({ "id": id, "result": prompt_context(&home, &params) })
+            }
             "command/run" => serde_json::json!({ "id": id, "result": command_run(&home, &params) }),
-            other => serde_json::json!({ "id": id, "error": { "code": -32601, "message": format!("method not found: {other}") } }),
+            other => {
+                serde_json::json!({ "id": id, "error": { "code": -32601, "message": format!("method not found: {other}") } })
+            }
         };
         let mut o = stdout.lock();
         writeln!(o, "{reply}")?;

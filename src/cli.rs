@@ -59,7 +59,7 @@ pub fn disabled() -> bool {
 /// `run_cli`, returning the lines instead of printing so `command/run` can
 /// answer with `{text}`.
 pub fn run(args: &MemoryArgs) -> anyhow::Result<String> {
-    run_at(args, &crate::gray_home()?, &std::env::current_dir()?)
+    run_at(args, &crate::memory_home()?, &std::env::current_dir()?)
 }
 
 /// Testable seam: the same dispatch against explicit home + cwd.

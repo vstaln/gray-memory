@@ -18,15 +18,19 @@ pub const PROTOCOL: &str = "1.1";
 /// The slash command this plugin owns.
 pub const COMMANDS: &[&str] = &["/memory"];
 
-/// `~/.gray`, overridable with `GRAY_HOME` (same resolution as
-/// `gray_core::paths::gray_home`).
-pub fn gray_home() -> anyhow::Result<PathBuf> {
-    std::env::var_os("GRAY_HOME")
-        .filter(|v| !v.to_string_lossy().trim().is_empty())
+/// The one universal memory home shared by every gray process regardless of
+/// its `GRAY_HOME`: `GRAY_MEMORY_HOME`, else `GRAY_USER_HOME`, else
+/// `<user home>/.gray`. `GRAY_HOME` is deliberately ignored.
+pub fn memory_home() -> anyhow::Result<PathBuf> {
+    ["GRAY_MEMORY_HOME", "GRAY_USER_HOME"]
+        .iter()
+        .find_map(|k| std::env::var_os(k).filter(|v| !v.to_string_lossy().trim().is_empty()))
         .map(PathBuf::from)
         .or_else(|| user_home().map(|p| p.join(".gray")))
         .ok_or_else(|| {
-            anyhow::anyhow!("cannot resolve home: set GRAY_HOME or the platform user profile")
+            anyhow::anyhow!(
+                "cannot resolve memory home: set GRAY_MEMORY_HOME or the platform user profile"
+            )
         })
 }
 

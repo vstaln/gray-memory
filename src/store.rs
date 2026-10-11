@@ -1,4 +1,4 @@
-//! Bounded, curated Markdown memory. One GRAY_HOME is one trusted owner.
+//! Bounded, curated Markdown memory. One memory home is one trusted owner.
 //! Commands use the existing bash surface; no extraction service or new tool.
 //!
 //! Ported verbatim from gray `crates/gray/src/memory.rs` (the feature moved
@@ -590,7 +590,7 @@ impl MemoryStore {
 /// How many consecutive net-growth saves with no removal trip the warning.
 const GROWTH_STREAK_WARN: usize = 3;
 
-/// Hard daily budget for the unattended ingest, per GRAY_HOME (shared by
+/// Hard daily budget for the unattended ingest, per memory home (shared by
 /// every project so a fleet of jobs cannot flood the store in one day).
 pub const INGEST_DAILY_WRITE_CAP: usize = 10;
 pub const INGEST_DAILY_USER_WRITE_CAP: usize = 2;
