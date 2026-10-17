@@ -18,7 +18,7 @@ use gray_memory::cli::{self, MemoryArgs};
 use gray_memory::store::MemoryStore;
 
 #[derive(Parser)]
-#[command(name = "gray-memory", about = "Curated cross-session memory")]
+#[command(name = "gray-memory", about = "Curated cross-session memory", version)]
 struct Cli {
     #[command(flatten)]
     args: MemoryArgs,
