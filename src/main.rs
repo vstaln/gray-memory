@@ -191,9 +191,6 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Err(e) => {
-            // clap prints its own usage for flag errors; exit code is its contract.
-            std::process::exit(if e.use_stderr() { 1 } else { 0 });
-        }
+        Err(e) => e.exit(),
     }
 }
