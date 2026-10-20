@@ -18,7 +18,7 @@ use gray_memory::cli::{self, MemoryArgs};
 use gray_memory::store::MemoryStore;
 
 #[derive(Parser)]
-#[command(name = "gray-memory", about = "Curated cross-session memory")]
+#[command(name = "gray-memory", about = "Curated cross-session memory", version)]
 struct Cli {
     #[command(flatten)]
     args: MemoryArgs,
@@ -29,12 +29,13 @@ fn manifest() -> serde_json::Value {
         "name": gray_memory::PLUGIN_NAME,
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": gray_memory::PROTOCOL,
-        "tools": [],
+        "tools": [gray_memory::tool_definition()],
         "commands": gray_memory::COMMANDS,
         "hooks": ["prompt/context"],
         // `gray memory <tab>` vocabulary for the host's completer.
         "completion": ["list", "show", "set", "edit", "remove", "clear",
-                       "audit", "ingest-set", "ingest-edit", "on", "off"],
+                       "audit", "ingest-set", "ingest-edit", "distill-log",
+                       "on", "off"],
     })
 }
 
@@ -66,8 +67,11 @@ fn prompt_context(home: &Path, params: &serde_json::Value) -> serde_json::Value 
     match snapshot {
         Ok(text) => serde_json::json!({ "text": gray_memory::served_text(&text) }),
         // Never fail a turn over memory: serve nothing and let the next turn
-        // retry.
-        Err(_) => serde_json::json!({}),
+        // retry. stderr is the sidecar's log channel — say why.
+        Err(e) => {
+            eprintln!("gray-memory: prompt/context snapshot failed: {e:#}");
+            serde_json::json!({})
+        }
     }
 }
 
@@ -114,10 +118,18 @@ fn command_run(home: &Path, params: &serde_json::Value) -> serde_json::Value {
         let entries = MemoryStore::new(home, &cwd)
             .map(|s| s.entry_count())
             .unwrap_or(0);
-        return serde_json::json!({ "text": format!(
+        let mut text = format!(
             "memory {} — {entries} entries · /memory off hides them from the model (entries keep saving)",
-            if gray_memory::enabled(home) { "on" } else { "off" }
-        )});
+            if gray_memory::enabled(home) {
+                "on"
+            } else {
+                "off"
+            }
+        );
+        if let Some(line) = gray_memory::distill::last_status_line(home) {
+            text.push_str(&format!(" · {line}"));
+        }
+        return serde_json::json!({ "text": text });
     }
     match Cli::try_parse_from(std::iter::once("memory".to_string()).chain(argv)) {
         Ok(cli) => match cli::run_at(&cli.args, home, &cwd) {
@@ -128,8 +140,48 @@ fn command_run(home: &Path, params: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// `tool/call`: the `memory` tool — the immediate write lane. Ops land on
+/// `ingest_set`/`ingest_edit` only; the reply never echoes store contents.
+fn tool_call(home: &Path, params: &serde_json::Value) -> serde_json::Value {
+    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    if name != gray_memory::TOOL_NAME {
+        return serde_json::json!({
+            "content": format!("unknown tool: {name}"),
+            "is_error": true,
+        });
+    }
+    if cli::disabled() {
+        return serde_json::json!({
+            "content": "memory saving disabled by GRAY_NO_MEMORY",
+            "is_error": true,
+        });
+    }
+    let cwd = params["session"]["cwd"]
+        .as_str()
+        .or_else(|| params["cwd"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(Path::new)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let args = params
+        .get("args")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    match MemoryStore::new(home, &cwd) {
+        Ok(store) => {
+            let (content, is_error) = gray_memory::tool_call(&store, &args);
+            serde_json::json!({ "content": content, "is_error": is_error })
+        }
+        Err(e) => serde_json::json!({ "content": format!("memory: {e:#}"), "is_error": true }),
+    }
+}
+
 fn sidecar_loop() -> anyhow::Result<()> {
     let home = gray_memory::memory_home()?;
+    // The cadenced distill: the writer that does not wait for the model to
+    // remember to remember. `None` inside distill workers and when the
+    // interval is configured to 0.
+    let distill = gray_memory::distill::Distill::new(&home);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -140,8 +192,15 @@ fn sidecar_loop() -> anyhow::Result<()> {
         if v.get("method").and_then(|m| m.as_str()) == Some("plugin/shutdown") {
             break;
         }
-        // Notifications (no id) need no reply.
+        // Notifications (no id) need no reply: `event/notify` turn_end is
+        // the distill cadence.
         let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
+            if v.get("method").and_then(|m| m.as_str()) == Some("event/notify")
+                && v["params"]["type"].as_str() == Some("turn_end")
+                && let Some(d) = &distill
+            {
+                d.tick(&v["params"]);
+            }
             continue;
         };
         let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -152,6 +211,7 @@ fn sidecar_loop() -> anyhow::Result<()> {
                 serde_json::json!({ "id": id, "result": prompt_context(&home, &params) })
             }
             "command/run" => serde_json::json!({ "id": id, "result": command_run(&home, &params) }),
+            "tool/call" => serde_json::json!({ "id": id, "result": tool_call(&home, &params) }),
             other => {
                 serde_json::json!({ "id": id, "error": { "code": -32601, "message": format!("method not found: {other}") } })
             }
@@ -167,6 +227,32 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("manifest") {
         println!("{}", manifest());
+        return;
+    }
+    // `gray-memory distill-run --session SID --cwd DIR [--model M]`: the
+    // detached cadenced-distill runner the sidecar spawns on turn_end.
+    if args.first().map(String::as_str) == Some("distill-run") {
+        let mut sid = String::new();
+        let mut cwd: Option<std::path::PathBuf> = None;
+        let mut model: Option<String> = None;
+        let mut it = args.iter().skip(1);
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--session" => sid = it.next().cloned().unwrap_or_default(),
+                "--cwd" => cwd = it.next().map(std::path::PathBuf::from),
+                "--model" => model = it.next().cloned(),
+                _ => {}
+            }
+        }
+        let home = match gray_memory::memory_home() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("gray-memory distill-run: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        gray_memory::distill::run(&home, &sid, &cwd, model.as_deref());
         return;
     }
     if args.is_empty() {
@@ -191,9 +277,6 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Err(e) => {
-            // clap prints its own usage for flag errors; exit code is its contract.
-            std::process::exit(if e.use_stderr() { 1 } else { 0 });
-        }
+        Err(e) => e.exit(),
     }
 }
