@@ -13,7 +13,23 @@ Curated cross-session memory for [gray](https://github.com/vstaln/gray),
 as a sidecar plugin (wire v1.1). Extracted from gray core — same store,
 same bytes, no longer built into the binary.
 
-One binary, three surfaces:
+One binary, four surfaces:
+
+- **`memory` tool** (`tool/call`) — the immediate write lane. `remember`
+  lands on `ingest_set`, `amend` on `ingest_edit`; there is no
+  `replace`/`remove`/`clear` in the tool's vocabulary, so the model can
+  only ever add flagged, auditable entries.
+- **cadenced distill** (`event/notify` `turn_end`) — the guaranteed
+  writer. Every `GRAY_MEMORY_DISTILL_EVERY` turns (default 4; `0` or a
+  `memory_distill_every: 0` config key disables) the sidecar spawns a
+  detached `distill-run` that feeds the transcript tail to a `--bare
+  --lean` `gray -p` worker and executes *only* the `ingest-set`/
+  `ingest-edit` lines it emits — the worker's `GRAY_MEMORY_HOME` is a
+  throwaway dir and `GRAY_NO_MEMORY=1` is set, so a poisoned transcript
+  can at worst leave a flagged entry, never wipe. `GRAY_MEMORY_DISTILL_MODEL`
+  (or `memory_distill_model` config) routes the worker to another model;
+  `gray memory distill-log` tails `<home>/memory/distill.log`; the bare
+  `/memory` status line reports the last run.
 
 - **`prompt/context`** serves the frozen per-session snapshot (the policy
   line plus non-empty `user`/`decisions` fields as compact JSON). The

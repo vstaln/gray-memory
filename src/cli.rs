@@ -42,6 +42,8 @@ pub enum MemoryCommand {
     IngestSet { key: String, text: String },
     /// Daily-ingest reconcile: the new text must keep the old one verbatim
     IngestEdit { key: String, text: String },
+    /// Recent cadenced-distill runs (the background writer)
+    DistillLog,
 }
 
 /// The hard kill-switch (`GRAY_NO_MEMORY`), same shape as core's
@@ -152,6 +154,9 @@ pub fn run_at(
                 }
             ));
             warn_on_growth(&mut out, &store, args.scope, changed);
+        }
+        MemoryCommand::DistillLog => {
+            out.push_str(&crate::distill::log_tail(home, 50));
         }
     }
     Ok(out)
