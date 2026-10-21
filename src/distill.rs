@@ -20,18 +20,12 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, ensure};
 
 use crate::store::{MemoryStore, Scope};
 
-/// Default cadence: one distill every N `turn_end`s
-/// (`GRAY_MEMORY_DISTILL_EVERY`, else `memory_distill_every` in
-/// config.json; `0` disables). The task-set default is ON — the whole
-/// point is a writer that does not depend on model whim.
-const DEFAULT_EVERY: u64 = 4;
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const TRANSCRIPT_WAIT: Duration = Duration::from_secs(12);
 const DISTILL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -41,34 +35,6 @@ const TRANSCRIPT_LAST: usize = 40;
 const PROMPT_MAX_BYTES: usize = 48 * 1024;
 const LOG_MAX_BYTES: u64 = 256 * 1024;
 const MAX_COMMANDS: usize = 8;
-
-fn env_truthy(key: &str) -> bool {
-    std::env::var(key).is_ok_and(|v| {
-        !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "no" | "off"
-        )
-    })
-}
-
-fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok()?.trim().parse().ok()
-}
-
-fn env_string(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
-/// A config.json key in the memory home (same file `memory_auto` lives in).
-fn config_value(home: &Path, key: &str) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(home.join("config.json")).ok()?;
-    serde_json::from_str::<serde_json::Value>(&text).ok()?[key]
-        .clone()
-        .into()
-}
 
 fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -160,147 +126,6 @@ pub fn last_status_line(home: &Path) -> Option<String> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Sidecar half: count turns, spawn the detached runner
-// ---------------------------------------------------------------------------
-
-/// The sidecar's distill ticker. `None` when distilling is off: inside a
-/// distill worker (`GRAY_MEMORY_DISTILL`, the recursion guard), or when
-/// the configured interval is 0.
-pub struct Distill {
-    home: PathBuf,
-    every: u64,
-    model: Option<String>,
-    inner: Mutex<Inner>,
-}
-
-struct Inner {
-    turns: u64,
-    next_at: u64,
-    disabled: bool,
-    /// `failed_ts` of the last failure already backed off for (§C.7: each
-    /// failure costs the next scheduled slot, once).
-    backed_off: String,
-}
-
-impl Distill {
-    pub fn new(home: &Path) -> Option<Self> {
-        // Recursion guard (§C.5): a distill worker is itself a `gray -p`
-        // session; its sidecars must never spawn another distill. Checked
-        // before the stop-marker reset so a worker can't re-enable the
-        // loop it was spawned by.
-        if env_truthy("GRAY_MEMORY_DISTILL") {
-            return None;
-        }
-        let every = env_u64("GRAY_MEMORY_DISTILL_EVERY")
-            .or_else(|| config_value(home, "memory_distill_every").and_then(|v| v.as_u64()))
-            .unwrap_or(DEFAULT_EVERY);
-        if every == 0 {
-            return None;
-        }
-        let model = env_string("GRAY_MEMORY_DISTILL_MODEL").or_else(|| {
-            config_value(home, "memory_distill_model").and_then(|v| v.as_str().map(str::to_string))
-        });
-        // The 3-failures stop flag lives for one process lifetime (§C.7):
-        // a fresh sidecar starts allowed again.
-        let _ = std::fs::remove_file(home.join("memory").join("distill.stopped"));
-        Some(Self {
-            home: home.to_path_buf(),
-            every,
-            model,
-            inner: Mutex::new(Inner {
-                turns: 0,
-                next_at: every,
-                disabled: false,
-                backed_off: String::new(),
-            }),
-        })
-    }
-
-    /// `event/notify` `turn_end`: bump the counter, fire when due.
-    pub fn tick(&self, params: &serde_json::Value) {
-        let sid = params["session"]["id"].as_str().unwrap_or("");
-        if sid.is_empty() || crate::cli::disabled() {
-            return;
-        }
-        if !crate::valid_session_id(sid) && crate::canonical_uuid(sid).is_none() {
-            return;
-        }
-        let cwd = params["session"]["cwd"]
-            .as_str()
-            .or_else(|| params["cwd"].as_str())
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let mut st = self.inner.lock().unwrap();
-        st.turns += 1;
-        if st.disabled || st.turns < st.next_at {
-            return;
-        }
-        let root = self.home.join("memory");
-        if root.join("distill.stopped").exists() {
-            st.disabled = true;
-            drop(st);
-            log_line(
-                &root,
-                "distill stopped for this process lifetime (3 consecutive failures)",
-            );
-            return;
-        }
-        let status = read_status(&root);
-        if status.last_failed && status.failed_ts != st.backed_off {
-            st.backed_off = status.failed_ts.clone();
-            st.next_at = st.turns + self.every;
-            return;
-        }
-        st.next_at = st.turns + self.every;
-        drop(st);
-        spawn_runner(&self.home, sid, &cwd, self.model.as_deref());
-    }
-}
-
-fn spawn_runner(home: &Path, sid: &str, cwd: &Path, model: Option<&str>) {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let mut cmd = Command::new(exe);
-    cmd.arg("distill-run")
-        .arg("--session")
-        .arg(sid)
-        .arg("--cwd")
-        .arg(cwd);
-    if let Some(m) = model {
-        cmd.arg("--model").arg(m);
-    }
-    cmd.stdin(Stdio::null()).stdout(Stdio::null());
-    match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(home.join("memory").join("distill.log"))
-    {
-        Ok(f) => {
-            cmd.stderr(Stdio::from(f));
-        }
-        Err(_) => {
-            cmd.stderr(Stdio::null());
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Own process group: a `gray -p` host can exit (and tear down this
-        // sidecar) while the distill is still running.
-        cmd.process_group(0);
-    }
-    let _ = cmd.spawn();
-}
-
-// ---------------------------------------------------------------------------
-// The runner: `gray-memory distill-run` — one full pass, then exit
-// ---------------------------------------------------------------------------
-
-/// `gray-memory distill-run --session SID --cwd DIR [--model M]`. Holds
-/// the flock for its lifetime; writes `distill.status` + `distill.log`.
 pub fn run(home: &Path, sid: &str, cwd: &Path, model: Option<&str>) {
     let root = home.join("memory");
     if crate::store::private_dir(&root).is_err() || root.join("distill.stopped").exists() {

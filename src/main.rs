@@ -178,10 +178,6 @@ fn tool_call(home: &Path, params: &serde_json::Value) -> serde_json::Value {
 
 fn sidecar_loop() -> anyhow::Result<()> {
     let home = gray_memory::memory_home()?;
-    // The cadenced distill: the writer that does not wait for the model to
-    // remember to remember. `None` inside distill workers and when the
-    // interval is configured to 0.
-    let distill = gray_memory::distill::Distill::new(&home);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -192,15 +188,8 @@ fn sidecar_loop() -> anyhow::Result<()> {
         if v.get("method").and_then(|m| m.as_str()) == Some("plugin/shutdown") {
             break;
         }
-        // Notifications (no id) need no reply: `event/notify` turn_end is
-        // the distill cadence.
+        // Notifications (no id) need no reply.
         let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
-            if v.get("method").and_then(|m| m.as_str()) == Some("event/notify")
-                && v["params"]["type"].as_str() == Some("turn_end")
-                && let Some(d) = &distill
-            {
-                d.tick(&v["params"]);
-            }
             continue;
         };
         let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
