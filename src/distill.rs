@@ -1,14 +1,15 @@
-//! The cadenced distill — the guaranteed writer (design §5/C).
+//! The manual distill (`gray-memory distill-run`).
 //!
-//! Every `GRAY_MEMORY_DISTILL_EVERY` (default 4) `turn_end`s the sidecar
-//! spawns a detached `gray-memory distill-run` subprocess, which: claims a
-//! flock for its lifetime, reads the transcript tail via `gray read`, asks
-//! a `gray -p` worker what is worth keeping, then executes *only* the
-//! `ingest-set`/`ingest-edit` commands the worker emits. The worker's write
-//! surface is structural — it emits text, this process parses it, and
-//! `set`/`edit`/`remove`/`clear` are not in its vocabulary. The ingest
-//! contract (`Why:`/`falsified:`, never-overwrite, daily budgets, secret
-//! redaction) does the rest.
+//! Reads the transcript tail via `gray read`, asks a `gray -p` worker what
+//! is worth keeping, then executes *only* the `ingest-set`/`ingest-edit`
+//! commands the worker emits. The worker's write surface is structural —
+//! it emits text, this process parses it, and `set`/`edit`/`remove`/`clear`
+//! are not in its vocabulary. The ingest contract (`Why:`/`falsified:`,
+//! never-overwrite, daily budgets, secret redaction) does the rest.
+//!
+//! Nothing calls this automatically: the `turn_end` ticker was removed —
+//! memory writes happen inline via the `memory` tool. `distill-run` stays
+//! as a manual verb and `gray memory distill-log` tails the log.
 //!
 //! Running in a detached subprocess (not a sidecar thread) is deliberate:
 //! a `gray -p` session ends right after its last `turn_end`, and the

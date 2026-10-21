@@ -42,8 +42,14 @@ pub enum MemoryCommand {
     IngestSet { key: String, text: String },
     /// Daily-ingest reconcile: the new text must keep the old one verbatim
     IngestEdit { key: String, text: String },
-    /// Recent cadenced-distill runs (the background writer)
+    /// Recent distill runs (`gray-memory distill-run` is a manual verb)
     DistillLog,
+    /// Serve memory in context again (same toggle as `/memory on`)
+    #[command(visible_alias = "enable")]
+    On,
+    /// Hide memory from the model; entries keep saving (same toggle as `/memory off`)
+    #[command(visible_alias = "disable")]
+    Off,
 }
 
 /// The hard kill-switch (`GRAY_NO_MEMORY`), same shape as core's
@@ -109,6 +115,7 @@ pub fn run_at(
             warn_on_growth(&mut out, &store, args.scope, changed);
         }
         MemoryCommand::Remove { key } => {
+            ensure!(!disabled(), "memory saving disabled by GRAY_NO_MEMORY");
             store.remove(args.scope, key)?;
             out.push_str(
                 "Memory removed. Existing sessions and transcripts retain their earlier context.\n",
@@ -157,6 +164,15 @@ pub fn run_at(
         }
         MemoryCommand::DistillLog => {
             out.push_str(&crate::distill::log_tail(home, 50));
+        }
+        MemoryCommand::On | MemoryCommand::Off => {
+            let on = matches!(args.command, MemoryCommand::On);
+            crate::set_enabled(home, on)?;
+            out.push_str(if on {
+                "\u{2713} memory on \u{2014} back in context\n"
+            } else {
+                "\u{2713} memory off \u{2014} hidden from the model, gray memory still saves\n"
+            });
         }
     }
     Ok(out)

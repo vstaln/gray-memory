@@ -201,6 +201,7 @@ impl MemoryStore {
         }
         let text = capture()?;
         atomic_write(&path, &text)?;
+        prune_snapshots(&dir);
         Ok(text)
     }
 
@@ -841,6 +842,36 @@ pub(crate) fn reject_symlinks(path: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Bound `snapshots/`: one `<session>.json` + `.lock` lands per durable
+/// session and nothing ever removed them. Runs only on a fresh freeze —
+/// replaying an existing snapshot never touches the directory. A pruned
+/// session that is ever resumed simply re-freezes against current memory.
+const SNAPSHOT_KEEP: usize = 512;
+
+fn prune_snapshots(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .map(|p| {
+            let m = p
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (m, p)
+        })
+        .collect();
+    if files.len() <= SNAPSHOT_KEEP {
+        return;
+    }
+    files.sort();
+    let excess = files.len() - SNAPSHOT_KEEP;
+    for (_, path) in files.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 pub(crate) fn private_dir(path: &Path) -> anyhow::Result<()> {
