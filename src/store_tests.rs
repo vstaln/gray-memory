@@ -467,6 +467,21 @@ fn first_sentence_ignores_abbreviations_and_decimals() {
 }
 
 #[test]
+fn first_sentence_ends_after_closers_and_drops_the_why_trailer() {
+    assert_eq!(
+        first_sentence("Trimmed the prompt (54%). Why: user asked. falsified: nothing yet"),
+        "Trimmed the prompt (54%)."
+    );
+    assert_eq!(
+        first_sentence("Run `cargo fmt` Why: CI gates it"),
+        "Run `cargo fmt`"
+    );
+    let long = first_sentence(&"word ".repeat(80));
+    assert_eq!(long.chars().count(), SUMMARY_CHARS);
+    assert!(long.ends_with('…'));
+}
+
+#[test]
 fn first_sentence_serves_whole_when_unbounded() {
     assert_eq!(first_sentence("No terminal period"), "No terminal period");
 }
@@ -485,18 +500,25 @@ fn profile_matches_list_when_every_entry_is_one_sentence() {
 #[test]
 fn injected_snapshot_keeps_the_newest_entries_and_says_what_it_dropped() {
     let (_dir, store) = setup();
-    let long = "x".repeat(2_000);
+    let long = "x".repeat(110);
     // The store path lives under a directory only a write creates; the first
     // save makes it, then the file is rewritten by hand so the save dates
     // differ — the cap has to choose between entries, and newest-wins.
     store.set(Scope::Project, "seed", "x").unwrap();
     std::fs::write(
         store.path(Scope::Project),
-        format!(
-            "- oldest: {long} <!-- gray:saved=2026-01-01;source=cli -->\n\
-             - middle: {long} <!-- gray:saved=2026-06-01;source=cli -->\n\
-             - newest: {long} <!-- gray:saved=2026-09-01;source=cli -->\n"
-        ),
+        std::iter::once(format!(
+            "- oldest: {long} <!-- gray:saved=2026-01-01;source=cli -->\n"
+        ))
+        .chain(
+            (1..=16).map(|i| {
+                format!("- e{i:02}: {long} <!-- gray:saved=2026-06-{i:02};source=cli -->\n")
+            }),
+        )
+        .chain(std::iter::once(format!(
+            "- newest: {long} <!-- gray:saved=2026-09-01;source=cli -->\n"
+        )))
+        .collect::<String>(),
     )
     .unwrap();
 
@@ -507,9 +529,9 @@ fn injected_snapshot_keeps_the_newest_entries_and_says_what_it_dropped() {
         served.len()
     );
     assert!(served.contains("- newest: "), "{served}");
-    assert!(served.contains("- middle: "), "{served}");
+    assert!(served.contains("- e16: "), "{served}");
     assert!(!served.contains("- oldest: "), "the oldest goes: {served}");
-    assert!(served.contains("+1 older entries not shown"), "{served}");
+    assert!(served.contains("older entries not shown"), "{served}");
     // The dropped entry is a command away, not gone.
     assert!(
         store.list(Scope::Project).unwrap().contains("- oldest: "),

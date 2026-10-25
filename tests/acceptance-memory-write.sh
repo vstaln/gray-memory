@@ -57,7 +57,7 @@ n=$(cd "$PROJ" && gray memory list --scope project | grep -c '^- ')
 snap=$(cd "$PROJ" && gray memory snapshot 2>/dev/null \
        || printf '{"id":1,"method":"prompt/context","params":{"session":{"id":"capcheck","cwd":"%s"}}}' "$PROJ" \
           | gray-memory 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["text"])' )
-echo "$snap" | grep -o '"decisions":"[^"]*"' | wc -c | { read b; [ "$b" -lt 4096 ] && echo "PASS: served scope $b bytes < 4KB" || { echo "FAIL: scope over cap"; FAIL=1; }; }
+echo "$snap" | sed -n '/^Project:$/,/^User:$/{/^Project:$/d;/^User:$/d;p}' | wc -c | { read b; [ "$b" -gt 0 ] && [ "$b" -le 2048 ] && echo "PASS: served scope $b bytes <= 2KB" || { echo "FAIL: scope empty or over cap ($b)"; FAIL=1; }; }
 
 note "gate 3 — rewrite instruction cannot wipe"
 before=$(cd "$PROJ" && gray memory list --scope project | grep -c '^- ')

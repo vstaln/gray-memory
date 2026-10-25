@@ -43,10 +43,25 @@ impl MemoryInjection {
     }
 }
 
-/// First sentence of an entry: cut at the first ". " whose preceding token
-/// is at least 2 characters, so "e.g. ", "i.e. " and "3.5 " never end a
-/// sentence. No truncation: an unbounded value is served whole.
-fn first_sentence(text: &str) -> &str {
+/// First sentence of an entry, without its " Why:" trailer: cut at the
+/// first ". " whose preceding token is at least 2 characters or absent, so
+/// "e.g. ", "i.e. " and "3.5 " never end a sentence but "(54%). " does.
+/// The result is capped at [`SUMMARY_CHARS`], ending in "…" when cut.
+fn first_sentence(text: &str) -> String {
+    let head = match text.find(" Why:") {
+        Some(i) => text[..i].trim_end(),
+        None => text,
+    };
+    let cut = sentence_end(head).unwrap_or(head);
+    if cut.chars().count() <= SUMMARY_CHARS {
+        return cut.to_string();
+    }
+    let mut s: String = cut.chars().take(SUMMARY_CHARS - 1).collect();
+    s.push('…');
+    s
+}
+
+fn sentence_end(text: &str) -> Option<&str> {
     let mut from = 0;
     while let Some(rel) = text[from..].find(". ") {
         let dot = from + rel;
@@ -62,12 +77,12 @@ fn first_sentence(text: &str) -> &str {
             }
             start -= prev.len_utf8();
         }
-        if dot - start >= 2 {
-            return &text[..dot + 1];
+        if start == dot || dot - start >= 2 {
+            return Some(&text[..dot + 1]);
         }
         from = dot + 2;
     }
-    text
+    None
 }
 
 pub struct MemoryStore {
@@ -226,7 +241,7 @@ impl MemoryStore {
         let mut entries: Vec<(String, String)> = store
             .entries
             .iter()
-            .map(|(key, text)| (key.clone(), first_sentence(text).to_owned()))
+            .map(|(key, text)| (key.clone(), first_sentence(text)))
             .collect();
         // The store is key-ordered, so order by write date instead: the
         // freshest belief is the one most likely to still hold. An unrecorded
@@ -243,7 +258,7 @@ impl MemoryStore {
         for (key, text) in entries {
             // "- " + key + ": " + text + "\n"
             let line = key.len() + text.len() + 5;
-            if used + line > SNAPSHOT_SCOPE_BYTES {
+            if used + line > SNAPSHOT_SCOPE_BYTES - CAP_NOTICE_RESERVE {
                 dropped += 1;
                 continue;
             }
@@ -810,7 +825,11 @@ fn render(store: &Store) -> String {
 /// editor tokens and not the executor's, and provenance is the same trade.
 /// Byte budget for one scope's injected memory block: a snapshot that rides
 /// in every turn's system prompt is billed every turn.
-const SNAPSHOT_SCOPE_BYTES: usize = 4 * 1024;
+const SNAPSHOT_SCOPE_BYTES: usize = 2 * 1024;
+
+const SUMMARY_CHARS: usize = 120;
+
+const CAP_NOTICE_RESERVE: usize = 80;
 
 /// The day an entry's current text was written, `""` when unrecorded.
 fn saved_on<'a>(store: &'a Store, key: &str) -> &'a str {
