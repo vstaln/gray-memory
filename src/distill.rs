@@ -1,14 +1,17 @@
-//! The cadenced distill — the guaranteed writer (design §5/C).
+//! The manual distill (`gray-memory distill-run`).
 //!
-//! Every `GRAY_MEMORY_DISTILL_EVERY` (default 4) `turn_end`s the sidecar
-//! spawns a detached `gray-memory distill-run` subprocess, which: claims a
-//! flock for its lifetime, reads the transcript tail via `gray read`, asks
-//! a `gray -p` worker what is worth keeping, then executes *only* the
-//! `ingest-set`/`ingest-edit` commands the worker emits. The worker's write
-//! surface is structural — it emits text, this process parses it, and
-//! `set`/`edit`/`remove`/`clear` are not in its vocabulary. The ingest
-//! contract (`Why:`/`falsified:`, never-overwrite, daily budgets, secret
-//! redaction) does the rest.
+//! Reads the transcript tail via `gray read`, asks a `gray -p` worker what
+//! is worth keeping, then executes *only* the `ingest-set`/`ingest-edit`
+//! commands the worker emits. The worker's write surface is structural —
+//! it emits text, this process parses it, and `set`/`edit`/`remove`/`clear`
+//! are not in its vocabulary. The ingest contract (`Why:`/`falsified:`,
+//! never-overwrite, daily budgets, secret redaction) does the rest.
+//!
+//! One trigger runs it automatically: `compact/before`. Right before the
+//! host compacts a session, [`pre_compact`] captures the transcript tail
+//! that is about to be summarized away and hands it to a detached runner
+//! (the per-turn `turn_end` ticker stays removed). `distill-run` is also a
+//! manual verb and `gray memory distill-log` tails the log.
 //!
 //! Running in a detached subprocess (not a sidecar thread) is deliberate:
 //! a `gray -p` session ends right after its last `turn_end`, and the
@@ -20,20 +23,16 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, ensure};
 
 use crate::store::{MemoryStore, Scope};
 
-/// Default cadence: one distill every N `turn_end`s
-/// (`GRAY_MEMORY_DISTILL_EVERY`, else `memory_distill_every` in
-/// config.json; `0` disables). The task-set default is ON — the whole
-/// point is a writer that does not depend on model whim.
-const DEFAULT_EVERY: u64 = 4;
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const TRANSCRIPT_WAIT: Duration = Duration::from_secs(12);
+/// Under the host's `compact/before` request timeout (20s).
+const PRE_COMPACT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const DISTILL_TIMEOUT: Duration = Duration::from_secs(120);
 const INGEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_FAILURES: u32 = 3;
@@ -41,34 +40,6 @@ const TRANSCRIPT_LAST: usize = 40;
 const PROMPT_MAX_BYTES: usize = 48 * 1024;
 const LOG_MAX_BYTES: u64 = 256 * 1024;
 const MAX_COMMANDS: usize = 8;
-
-fn env_truthy(key: &str) -> bool {
-    std::env::var(key).is_ok_and(|v| {
-        !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "no" | "off"
-        )
-    })
-}
-
-fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok()?.trim().parse().ok()
-}
-
-fn env_string(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
-/// A config.json key in the memory home (same file `memory_auto` lives in).
-fn config_value(home: &Path, key: &str) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(home.join("config.json")).ok()?;
-    serde_json::from_str::<serde_json::Value>(&text).ok()?[key]
-        .clone()
-        .into()
-}
 
 fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -160,115 +131,76 @@ pub fn last_status_line(home: &Path) -> Option<String> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Sidecar half: count turns, spawn the detached runner
-// ---------------------------------------------------------------------------
+/// Deletes a captured transcript once the runner is done with it.
+struct RemoveOnDrop<'a>(&'a Path);
 
-/// The sidecar's distill ticker. `None` when distilling is off: inside a
-/// distill worker (`GRAY_MEMORY_DISTILL`, the recursion guard), or when
-/// the configured interval is 0.
-pub struct Distill {
-    home: PathBuf,
-    every: u64,
-    model: Option<String>,
-    inner: Mutex<Inner>,
-}
-
-struct Inner {
-    turns: u64,
-    next_at: u64,
-    disabled: bool,
-    /// `failed_ts` of the last failure already backed off for (§C.7: each
-    /// failure costs the next scheduled slot, once).
-    backed_off: String,
-}
-
-impl Distill {
-    pub fn new(home: &Path) -> Option<Self> {
-        // Recursion guard (§C.5): a distill worker is itself a `gray -p`
-        // session; its sidecars must never spawn another distill. Checked
-        // before the stop-marker reset so a worker can't re-enable the
-        // loop it was spawned by.
-        if env_truthy("GRAY_MEMORY_DISTILL") {
-            return None;
-        }
-        let every = env_u64("GRAY_MEMORY_DISTILL_EVERY")
-            .or_else(|| config_value(home, "memory_distill_every").and_then(|v| v.as_u64()))
-            .unwrap_or(DEFAULT_EVERY);
-        if every == 0 {
-            return None;
-        }
-        let model = env_string("GRAY_MEMORY_DISTILL_MODEL").or_else(|| {
-            config_value(home, "memory_distill_model").and_then(|v| v.as_str().map(str::to_string))
-        });
-        // The 3-failures stop flag lives for one process lifetime (§C.7):
-        // a fresh sidecar starts allowed again.
-        let _ = std::fs::remove_file(home.join("memory").join("distill.stopped"));
-        Some(Self {
-            home: home.to_path_buf(),
-            every,
-            model,
-            inner: Mutex::new(Inner {
-                turns: 0,
-                next_at: every,
-                disabled: false,
-                backed_off: String::new(),
-            }),
-        })
-    }
-
-    /// `event/notify` `turn_end`: bump the counter, fire when due.
-    pub fn tick(&self, params: &serde_json::Value) {
-        let sid = params["session"]["id"].as_str().unwrap_or("");
-        if sid.is_empty() || crate::cli::disabled() {
-            return;
-        }
-        if !crate::valid_session_id(sid) && crate::canonical_uuid(sid).is_none() {
-            return;
-        }
-        let cwd = params["session"]["cwd"]
-            .as_str()
-            .or_else(|| params["cwd"].as_str())
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let mut st = self.inner.lock().unwrap();
-        st.turns += 1;
-        if st.disabled || st.turns < st.next_at {
-            return;
-        }
-        let root = self.home.join("memory");
-        if root.join("distill.stopped").exists() {
-            st.disabled = true;
-            drop(st);
-            log_line(
-                &root,
-                "distill stopped for this process lifetime (3 consecutive failures)",
-            );
-            return;
-        }
-        let status = read_status(&root);
-        if status.last_failed && status.failed_ts != st.backed_off {
-            st.backed_off = status.failed_ts.clone();
-            st.next_at = st.turns + self.every;
-            return;
-        }
-        st.next_at = st.turns + self.every;
-        drop(st);
-        spawn_runner(&self.home, sid, &cwd, self.model.as_deref());
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
     }
 }
 
-fn spawn_runner(home: &Path, sid: &str, cwd: &Path, model: Option<&str>) {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let mut cmd = Command::new(exe);
+/// `compact/before`: the host is about to summarize this session's history
+/// away. Capture the tail now (synchronously, so the host's compaction
+/// can't race the read), then distill it in a detached runner so the host
+/// isn't held up by a model call.
+pub fn pre_compact(home: &Path, params: &serde_json::Value) -> anyhow::Result<()> {
+    ensure!(!crate::cli::disabled(), "memory disabled (GRAY_NO_MEMORY)");
+    // Recursion guard: a distill worker is itself a `gray -p` session.
+    if std::env::var_os("GRAY_MEMORY_DISTILL").is_some() || !crate::enabled(home) {
+        return Ok(());
+    }
+    let sid = params["session"]["id"].as_str().unwrap_or("");
+    ensure!(
+        crate::valid_session_id(sid) || crate::canonical_uuid(sid).is_some(),
+        "invalid session id {sid:?}"
+    );
+    let cwd = params["session"]["cwd"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut read = Command::new("gray");
+    read.args(["read", sid, "--last", &TRANSCRIPT_LAST.to_string()]);
+    let out = run_capped(&mut read, None, PRE_COMPACT_READ_TIMEOUT)?;
+    ensure!(
+        out.status.is_some_and(|s| s.success()) && !out.stdout.trim().is_empty(),
+        "gray read failed: {}",
+        out.stderr.trim()
+    );
+    let root = home.join("memory");
+    let pending = root.join("pending");
+    crate::store::private_dir(&pending)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = pending.join(format!("{sid}.{nanos}.txt"));
+    std::fs::write(&path, out.stdout.as_bytes())?;
+    // Compaction is rare, so the 3-failure stop marker (meant to stop a
+    // per-turn loop) shouldn't silence every later compaction for good.
+    let _ = std::fs::remove_file(root.join("distill.stopped"));
+    let model = std::env::var("GRAY_MEMORY_DISTILL_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty());
+    spawn_runner(home, sid, &cwd, model.as_deref(), &path)
+}
+
+fn spawn_runner(
+    home: &Path,
+    sid: &str,
+    cwd: &Path,
+    model: Option<&str>,
+    transcript: &Path,
+) -> anyhow::Result<()> {
+    let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("distill-run")
         .arg("--session")
         .arg(sid)
         .arg("--cwd")
-        .arg(cwd);
+        .arg(cwd)
+        .arg("--transcript")
+        .arg(transcript);
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
     }
@@ -278,13 +210,9 @@ fn spawn_runner(home: &Path, sid: &str, cwd: &Path, model: Option<&str>) {
         .append(true)
         .open(home.join("memory").join("distill.log"))
     {
-        Ok(f) => {
-            cmd.stderr(Stdio::from(f));
-        }
-        Err(_) => {
-            cmd.stderr(Stdio::null());
-        }
-    }
+        Ok(f) => cmd.stderr(Stdio::from(f)),
+        Err(_) => cmd.stderr(Stdio::null()),
+    };
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -292,17 +220,20 @@ fn spawn_runner(home: &Path, sid: &str, cwd: &Path, model: Option<&str>) {
         // sidecar) while the distill is still running.
         cmd.process_group(0);
     }
-    let _ = cmd.spawn();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().context("spawn distill runner")?;
+    Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// The runner: `gray-memory distill-run` — one full pass, then exit
-// ---------------------------------------------------------------------------
-
-/// `gray-memory distill-run --session SID --cwd DIR [--model M]`. Holds
-/// the flock for its lifetime; writes `distill.status` + `distill.log`.
-pub fn run(home: &Path, sid: &str, cwd: &Path, model: Option<&str>) {
+pub fn run(home: &Path, sid: &str, cwd: &Path, model: Option<&str>, transcript: Option<&Path>) {
     let root = home.join("memory");
+    let _cleanup = transcript.map(RemoveOnDrop);
     if crate::store::private_dir(&root).is_err() || root.join("distill.stopped").exists() {
         return;
     }
@@ -329,7 +260,7 @@ pub fn run(home: &Path, sid: &str, cwd: &Path, model: Option<&str>) {
         now_iso()
     );
 
-    let outcome = distill_once(home, &root, sid, cwd, model);
+    let outcome = distill_once(home, &root, sid, cwd, model, transcript);
     let mut st = read_status(&root);
     st.ts = now_iso();
     st.session = sid.to_string();
@@ -396,8 +327,17 @@ fn distill_once(
     sid: &str,
     cwd: &Path,
     model: Option<&str>,
+    captured: Option<&Path>,
 ) -> anyhow::Result<Summary> {
     ensure!(!crate::cli::disabled(), "memory disabled (GRAY_NO_MEMORY)");
+    if let Some(path) = captured {
+        let transcript = std::fs::read_to_string(path).context("read captured transcript")?;
+        ensure!(
+            !transcript.trim().is_empty(),
+            "captured transcript is empty"
+        );
+        return distill_text(home, root, sid, cwd, model, &transcript);
+    }
     // The transcript can still be flushing when turn_end arrives — a `-p`
     // session is mid-exit — so retry for a few seconds before giving up.
     let deadline = Instant::now() + TRANSCRIPT_WAIT;
@@ -416,6 +356,17 @@ fn distill_once(
             _ => std::thread::sleep(Duration::from_secs(1)),
         }
     };
+    distill_text(home, root, sid, cwd, model, &transcript)
+}
+
+fn distill_text(
+    home: &Path,
+    root: &Path,
+    sid: &str,
+    cwd: &Path,
+    model: Option<&str>,
+    transcript: &str,
+) -> anyhow::Result<Summary> {
     let (project, user) = MemoryStore::new(home, cwd)
         .map(|s| {
             (
@@ -424,7 +375,7 @@ fn distill_once(
             )
         })
         .unwrap_or_default();
-    let prompt = worker_prompt(sid, &project, &user, &transcript);
+    let prompt = worker_prompt(sid, &project, &user, transcript);
 
     // The worker is sandboxed two ways. It runs `--bare --lean` — no
     // plugins, no sidecars, no snapshot — and its GRAY_MEMORY_HOME is a

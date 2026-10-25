@@ -31,7 +31,7 @@ fn manifest() -> serde_json::Value {
         "protocol": gray_memory::PROTOCOL,
         "tools": [gray_memory::tool_definition()],
         "commands": gray_memory::COMMANDS,
-        "hooks": ["prompt/context"],
+        "hooks": ["prompt/context", "compact/before"],
         // `gray memory <tab>` vocabulary for the host's completer.
         "completion": ["list", "show", "set", "edit", "remove", "clear",
                        "audit", "ingest-set", "ingest-edit", "distill-log",
@@ -178,10 +178,6 @@ fn tool_call(home: &Path, params: &serde_json::Value) -> serde_json::Value {
 
 fn sidecar_loop() -> anyhow::Result<()> {
     let home = gray_memory::memory_home()?;
-    // The cadenced distill: the writer that does not wait for the model to
-    // remember to remember. `None` inside distill workers and when the
-    // interval is configured to 0.
-    let distill = gray_memory::distill::Distill::new(&home);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -192,15 +188,8 @@ fn sidecar_loop() -> anyhow::Result<()> {
         if v.get("method").and_then(|m| m.as_str()) == Some("plugin/shutdown") {
             break;
         }
-        // Notifications (no id) need no reply: `event/notify` turn_end is
-        // the distill cadence.
+        // Notifications (no id) need no reply.
         let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
-            if v.get("method").and_then(|m| m.as_str()) == Some("event/notify")
-                && v["params"]["type"].as_str() == Some("turn_end")
-                && let Some(d) = &distill
-            {
-                d.tick(&v["params"]);
-            }
             continue;
         };
         let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -212,6 +201,14 @@ fn sidecar_loop() -> anyhow::Result<()> {
             }
             "command/run" => serde_json::json!({ "id": id, "result": command_run(&home, &params) }),
             "tool/call" => serde_json::json!({ "id": id, "result": tool_call(&home, &params) }),
+            // Reply only after the transcript is captured: the host waits
+            // for this before it compacts. Never fail a compaction over memory.
+            "compact/before" => {
+                if let Err(e) = gray_memory::distill::pre_compact(&home, &params) {
+                    eprintln!("gray-memory: compact/before: {e:#}");
+                }
+                serde_json::json!({ "id": id, "result": {} })
+            }
             other => {
                 serde_json::json!({ "id": id, "error": { "code": -32601, "message": format!("method not found: {other}") } })
             }
@@ -229,18 +226,21 @@ fn main() {
         println!("{}", manifest());
         return;
     }
-    // `gray-memory distill-run --session SID --cwd DIR [--model M]`: the
-    // detached cadenced-distill runner the sidecar spawns on turn_end.
+    // `gray-memory distill-run --session SID --cwd DIR [--model M]
+    // [--transcript FILE]`: one distill pass, either the detached runner
+    // the sidecar spawns on `compact/before` or a manual run.
     if args.first().map(String::as_str) == Some("distill-run") {
         let mut sid = String::new();
         let mut cwd: Option<std::path::PathBuf> = None;
         let mut model: Option<String> = None;
+        let mut transcript: Option<std::path::PathBuf> = None;
         let mut it = args.iter().skip(1);
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--session" => sid = it.next().cloned().unwrap_or_default(),
                 "--cwd" => cwd = it.next().map(std::path::PathBuf::from),
                 "--model" => model = it.next().cloned(),
+                "--transcript" => transcript = it.next().map(std::path::PathBuf::from),
                 _ => {}
             }
         }
@@ -252,7 +252,7 @@ fn main() {
             }
         };
         let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        gray_memory::distill::run(&home, &sid, &cwd, model.as_deref());
+        gray_memory::distill::run(&home, &sid, &cwd, model.as_deref(), transcript.as_deref());
         return;
     }
     if args.is_empty() {

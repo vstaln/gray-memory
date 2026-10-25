@@ -19,20 +19,20 @@ One binary, four surfaces:
   lands on `ingest_set`, `amend` on `ingest_edit`; there is no
   `replace`/`remove`/`clear` in the tool's vocabulary, so the model can
   only ever add flagged, auditable entries.
-- **cadenced distill** (`event/notify` `turn_end`) — the guaranteed
-  writer. Every `GRAY_MEMORY_DISTILL_EVERY` turns (default 4; `0` or a
-  `memory_distill_every: 0` config key disables) the sidecar spawns a
-  detached `distill-run` that feeds the transcript tail to a `--bare
-  --lean` `gray -p` worker and executes *only* the `ingest-set`/
-  `ingest-edit` lines it emits — the worker's `GRAY_MEMORY_HOME` is a
-  throwaway dir and `GRAY_NO_MEMORY=1` is set, so a poisoned transcript
-  can at worst leave a flagged entry, never wipe. `GRAY_MEMORY_DISTILL_MODEL`
-  (or `memory_distill_model` config) routes the worker to another model;
-  `gray memory distill-log` tails `<home>/memory/distill.log`; the bare
-  `/memory` status line reports the last run.
+- **manual distill** (`gray-memory distill-run --session SID --cwd DIR
+  [--model M]`) — an on-demand ingest pass: reads the transcript tail via
+  `gray read`, asks a `--bare --lean` `gray -p` worker what is worth
+  keeping, and executes *only* the `ingest-set`/`ingest-edit` lines it
+  emits — the worker's `GRAY_MEMORY_HOME` is a throwaway dir and
+  `GRAY_NO_MEMORY=1` is set, so a poisoned transcript can at worst leave a
+  flagged entry, never wipe. Nothing invokes it automatically (the
+  turn_end ticker was removed — writes happen inline via the `memory`
+  tool). `gray memory distill-log` tails `<home>/memory/distill.log`; the
+  bare `/memory` status line reports the last run.
 
 - **`prompt/context`** serves the frozen per-session snapshot (the policy
-  line plus non-empty `user`/`decisions` fields as compact JSON). The
+  line plus non-empty `decisions`/`user` fields as `Project:`/`User:`
+  blocks, one capped summary line per entry). The
   freeze is pinned by `session.id` on the wire, so a session replays
   identical bytes on rebuild — the provider prefix-cache stays warm.
 - **`/memory …`** runs over `command/run`: `on|off` flips the plugin's own
