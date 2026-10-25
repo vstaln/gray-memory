@@ -851,7 +851,9 @@ pub(crate) fn reject_symlinks(path: &Path) -> anyhow::Result<()> {
 const SNAPSHOT_KEEP: usize = 512;
 
 fn prune_snapshots(dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
         .filter_map(|e| e.ok())
         .map(|e| e.path())
