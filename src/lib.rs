@@ -310,7 +310,7 @@ mod lib_tests {
 
     #[test]
     fn enabled_marker_wins_over_legacy_config() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let home = dir.path();
         // Legacy `/memory off` seeds off; an explicit marker overrides it.
         std::fs::write(home.join("config.json"), r#"{"memory_auto":false}"#).unwrap();
