@@ -266,6 +266,10 @@ fn distill_once(
     worker
         .args(["--bare", "--lean", "-p", "-"])
         .env("GRAY_MEMORY_DISTILL", "1")
+        // Internal housekeeping, not a user subagent: keep it out of the
+        // gray-subagents panel and tag its session for what it is.
+        .env("GRAY_HIDDEN_WORKER", "1")
+        .env("GRAY_SESSION_ORIGIN", "memory-distill")
         .env("GRAY_MEMORY_HOME", &scratch)
         .env("GRAY_NO_MEMORY", "1")
         .current_dir(cwd);
