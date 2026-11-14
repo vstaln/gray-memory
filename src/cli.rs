@@ -42,6 +42,19 @@ pub enum MemoryCommand {
     IngestSet { key: String, text: String },
     /// Daily-ingest reconcile: the new text must keep the old one verbatim
     IngestEdit { key: String, text: String },
+    /// Daily-ingest replace: overwrite an entry (the old text goes to history)
+    #[command(hide = true)]
+    IngestUpdate { key: String, text: String },
+    /// Daily-ingest delete (the old text goes to history)
+    #[command(hide = true)]
+    IngestRemove { key: String },
+    /// Recent updates and removals, newest last
+    History {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Put back the most recent old text for KEY (re-adds it if it was removed)
+    Restore { key: String },
     /// Recent distill runs (`gray-memory distill-run` is a manual verb)
     DistillLog,
     /// Serve memory in context again (same toggle as `/memory on`)
@@ -161,6 +174,44 @@ pub fn run_at(
                 }
             ));
             warn_on_growth(&mut out, &store, args.scope, changed);
+        }
+        MemoryCommand::IngestUpdate { key, text } => {
+            ensure!(!disabled(), "memory saving disabled by GRAY_NO_MEMORY");
+            let changed = store.ingest_update(args.scope, key, text)?;
+            out.push_str(&format!(
+                "{}\n",
+                if changed {
+                    "Memory updated."
+                } else {
+                    "Memory unchanged."
+                }
+            ));
+            warn_on_growth(&mut out, &store, args.scope, changed);
+        }
+        MemoryCommand::IngestRemove { key } => {
+            ensure!(!disabled(), "memory saving disabled by GRAY_NO_MEMORY");
+            store.remove_logged(args.scope, key)?;
+            out.push_str("Memory removed.\n");
+        }
+        MemoryCommand::History { limit } => {
+            let entries = store.history_tail(*limit)?;
+            if entries.is_empty() {
+                out.push_str("No memory history.\n");
+            }
+            for entry in entries {
+                out.push_str(&format!(
+                    "{}  {}  {}  {}\n  old: {}\n",
+                    entry.ts, entry.op, entry.scope, entry.key, entry.old_text
+                ));
+            }
+        }
+        MemoryCommand::Restore { key } => {
+            ensure!(!disabled(), "memory saving disabled by GRAY_NO_MEMORY");
+            let (scope, text) = store.restore(key)?;
+            out.push_str(&format!(
+                "Memory restored to {} scope: - {key}: {text}\n",
+                crate::store::scope_label(scope)
+            ));
         }
         MemoryCommand::DistillLog => {
             out.push_str(&crate::distill::log_tail(home, 50));

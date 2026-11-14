@@ -427,11 +427,18 @@ fn distill_text(
         ingest
             .arg("--scope")
             .arg(if c.user_scope { "user" } else { "project" })
-            .arg(if c.edit { "ingest-edit" } else { "ingest-set" })
+            .arg(match c.op {
+                IngestOp::Set => "ingest-set",
+                IngestOp::Edit => "ingest-edit",
+                IngestOp::Update => "ingest-update",
+                IngestOp::Remove => "ingest-remove",
+            })
             .arg(&c.key)
-            .arg(&c.text)
             .current_dir(cwd)
             .env("GRAY_SESSION_ID", sid);
+        if c.op != IngestOp::Remove {
+            ingest.arg(&c.text);
+        }
         match run_capped(&mut ingest, None, INGEST_TIMEOUT) {
             Ok(o) if o.status.is_some_and(|s| s.success()) => sum.added += 1,
             Ok(o) => {
@@ -510,7 +517,8 @@ TRANSCRIPT TAIL:\n\
 Reply with one command per line and nothing else:\n\
   gray memory ingest-set KEY TEXT            new project-scope entry\n\
   gray memory ingest-set --scope user KEY TEXT\n\
-  gray memory ingest-edit KEY TEXT           extend an existing entry — TEXT must keep the old text verbatim\n\
+  gray memory ingest-update KEY TEXT         replace an existing entry — TEXT need not keep the old text\n\
+  gray memory ingest-remove KEY              delete an entry that stopped being true\n\
 KEY is a short ASCII slug (letters, digits, '-' or '_'). TEXT is a single line that must \
 contain `Why: <what prompted this>` and `falsified: <what would disprove it, or \
 \"nothing yet\">`.\n\
@@ -534,10 +542,18 @@ If nothing is worth saving, reply exactly: NOTHING",
 // Worker output → ingest commands (the structural sandbox)
 // ---------------------------------------------------------------------------
 
-/// One parsed `gray memory ingest-set|ingest-edit` line.
+/// One parsed `gray memory ingest-*` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IngestOp {
+    Set,
+    Edit,
+    Update,
+    Remove,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) struct Parsed {
-    pub edit: bool,
+    pub op: IngestOp,
     pub user_scope: bool,
     pub key: String,
     pub text: String,
@@ -569,16 +585,25 @@ pub(crate) fn parse_worker_commands(out: &str) -> Vec<Parsed> {
                 _ => positional.push(t),
             }
         }
-        if positional.len() < 3 {
+        let Some(verb) = positional.first() else {
             continue;
-        }
-        let edit = match positional[0] {
-            "ingest-set" => false,
-            "ingest-edit" => true,
+        };
+        let (op, arity) = match *verb {
+            "ingest-set" => (IngestOp::Set, 3),
+            "ingest-edit" => (IngestOp::Edit, 3),
+            "ingest-update" => (IngestOp::Update, 3),
+            "ingest-remove" => (IngestOp::Remove, 2),
             _ => continue,
         };
+        if positional.len() < arity {
+            continue;
+        }
         let key = positional[1].to_string();
-        let mut text = positional[2..].join(" ");
+        let mut text = if positional.len() > 2 {
+            positional[2..].join(" ")
+        } else {
+            String::new()
+        };
         // Strip one layer of matching outer quotes the model may add.
         if text.len() >= 2 {
             let b = text.as_bytes();
@@ -588,11 +613,11 @@ pub(crate) fn parse_worker_commands(out: &str) -> Vec<Parsed> {
                 text = text[1..text.len() - 1].to_string();
             }
         }
-        if text.is_empty() {
+        if text.is_empty() && op != IngestOp::Remove {
             continue;
         }
         v.push(Parsed {
-            edit,
+            op,
             user_scope,
             key,
             text,
@@ -689,7 +714,7 @@ mod tests {
         let cmds = parse_worker_commands(out);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].key, "release-branch");
-        assert!(!cmds[0].edit);
+        assert_eq!(cmds[0].op, IngestOp::Set);
         assert!(!cmds[0].user_scope);
         assert_eq!(
             cmds[0].text,
@@ -702,7 +727,7 @@ mod tests {
         let out = "gray memory ingest-edit --scope user editor-pref prefers vim Why: correction falsified: nothing yet";
         let cmds = parse_worker_commands(out);
         assert_eq!(cmds.len(), 1);
-        assert!(cmds[0].edit);
+        assert_eq!(cmds[0].op, IngestOp::Edit);
         assert!(cmds[0].user_scope);
         assert_eq!(cmds[0].key, "editor-pref");
         assert_eq!(
