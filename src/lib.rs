@@ -172,7 +172,7 @@ pub fn tool_definition() -> serde_json::Value {
                 "op": {
                     "type": "string",
                     "enum": ["add", "update", "remove"],
-                    "description": "add (default): a new entry, the key must not exist. update: replace an existing entry's text entirely. remove: delete an entry."
+                    "description": "add (default): a new entry. update: replace an entry's text entirely; a key that does not exist yet is created, and the previous text is kept in history. remove: delete an entry."
                 },
                 "key": {
                     "type": "string",
@@ -193,7 +193,7 @@ pub fn tool_definition() -> serde_json::Value {
                 }
             },
             "required": ["key"],
-            "additionalProperties": false
+            "additionalProperties": true
         }
     })
 }
@@ -227,8 +227,8 @@ fn with_rationale(text: &str, args: &serde_json::Value) -> String {
 pub fn tool_call(store: &store::MemoryStore, args: &serde_json::Value) -> (String, bool) {
     let op = match args["op"].as_str().unwrap_or("add") {
         "add" | "remember" => ToolOp::Add,
-        "update" | "amend" => ToolOp::Update,
-        "remove" => ToolOp::Remove,
+        "update" | "amend" | "edit" | "set" => ToolOp::Update,
+        "remove" | "delete" | "forget" => ToolOp::Remove,
         other => {
             return (
                 format!("memory: unknown op '{other}' — use `add`, `update` or `remove`"),

@@ -618,17 +618,22 @@ fn ingest_edit_is_append_only_and_keeps_both_claims() {
     let (_dir, store) = setup();
     let old = "Claim A. Why: user: \"x\"; falsified: nothing yet";
     store.ingest_set(Scope::Project, "k", old).unwrap();
-    // Unknown key: edit fails.
+    // An unknown key is created rather than refused.
     assert!(
         store
             .ingest_edit(Scope::Project, "nope", "New. Why: y; falsified: z")
-            .is_err()
+            .unwrap()
     );
-    // A replacement that drops the old claim fails.
+    // A replacement that drops the old claim is merged, never dropped.
     assert!(
         store
             .ingest_edit(Scope::Project, "k", "Claim B. Why: y; falsified: z")
-            .is_err()
+            .unwrap()
+    );
+    let merged = store.get(Scope::Project, "k").unwrap().unwrap();
+    assert!(
+        merged.contains("Claim A.") && merged.contains("Claim B."),
+        "{merged}"
     );
     // The reconciliation shape passes and keeps both.
     let new =
