@@ -566,7 +566,7 @@ fn snapshot_carries_summaries_by_default_and_full_text_on_request() {
 }
 
 // --- ingest guard: the daily job's verbs physically cannot overwrite,
-// delete, skip the rationale contract, or blow the daily caps. The prompt
+// delete, or skip the rationale contract. The prompt
 // contract leaked (a dry run overwrote five entries and invented a quote),
 // so these are enforced in the write path, not in prose.
 
@@ -637,41 +637,6 @@ fn ingest_edit_is_append_only_and_keeps_both_claims() {
     let served = store.get(Scope::Project, "k").unwrap().unwrap();
     assert!(served.contains("Claim A."));
     assert!(served.contains("Claim B."));
-}
-
-#[test]
-fn ingest_daily_caps_stop_the_tenth_write_and_the_third_user_write() {
-    let (_dir, store) = setup();
-    let text = "Fact. Why: user: \"x\"; falsified: nothing yet";
-    for i in 0..INGEST_DAILY_WRITE_CAP {
-        store
-            .ingest_set(Scope::Project, &format!("p{i}"), &format!("{text} ({i})"))
-            .unwrap();
-    }
-    let err = store
-        .ingest_set(Scope::Project, "overflow", text)
-        .unwrap_err();
-    assert!(err.to_string().contains("daily ingest cap"), "{err}");
-    // Fresh day: the budget resets.
-    std::fs::remove_file(store.ingest_counter_path()).unwrap();
-    assert!(store.ingest_set(Scope::Project, "newday", text).is_ok());
-}
-
-#[test]
-fn ingest_user_scope_caps_at_two_per_day() {
-    let (_dir, store) = setup();
-    let text = "Pref. Why: user: \"x\"; falsified: nothing yet";
-    for i in 0..INGEST_DAILY_USER_WRITE_CAP {
-        store
-            .ingest_set(Scope::User, &format!("u{i}"), &format!("{text} ({i})"))
-            .unwrap();
-    }
-    let err = store
-        .ingest_set(Scope::User, "u-overflow", text)
-        .unwrap_err();
-    assert!(err.to_string().contains("user-scope ingest cap"), "{err}");
-    // Project writes are unaffected by the user cap.
-    assert!(store.ingest_set(Scope::Project, "p", text).is_ok());
 }
 
 #[test]

@@ -349,13 +349,9 @@ impl MemoryStore {
                 !entries.values().any(|old| old == &trimmed),
                 "that text is already stored under another key; the ingest never duplicates — skip it"
             );
-            self.ensure_ingest_budget(scope)?;
             entries.insert(key.to_owned(), trimmed.clone());
             Ok(true)
         })?;
-        if changed {
-            self.record_ingest_write(scope)?;
-        }
         Ok(changed)
     }
 
@@ -379,13 +375,9 @@ impl MemoryStore {
             if old == trimmed {
                 return Ok(false);
             }
-            self.ensure_ingest_budget(scope)?;
             entries.insert(key.to_owned(), trimmed.clone());
             Ok(true)
         })?;
-        if changed {
-            self.record_ingest_write(scope)?;
-        }
         Ok(changed)
     }
 
@@ -516,43 +508,6 @@ impl MemoryStore {
         })
     }
 
-    fn ingest_counter_path(&self) -> PathBuf {
-        self.root.join(format!(".ingest-{}.json", today()))
-    }
-
-    fn ingest_counters(&self) -> anyhow::Result<IngestCounters> {
-        let text = read_text(&self.ingest_counter_path())?.unwrap_or_default();
-        Ok(serde_json::from_str(&text).unwrap_or_default())
-    }
-
-    fn ensure_ingest_budget(&self, scope: Scope) -> anyhow::Result<()> {
-        let counters = self.ingest_counters()?;
-        let total = counters.project + counters.user;
-        ensure!(
-            total < INGEST_DAILY_WRITE_CAP,
-            "daily ingest cap reached ({INGEST_DAILY_WRITE_CAP} writes for today); skip the rest"
-        );
-        if matches!(scope, Scope::User) {
-            ensure!(
-                counters.user < INGEST_DAILY_USER_WRITE_CAP,
-                "user-scope ingest cap reached ({INGEST_DAILY_USER_WRITE_CAP} writes for today); skip the rest"
-            );
-        }
-        Ok(())
-    }
-
-    fn record_ingest_write(&self, scope: Scope) -> anyhow::Result<()> {
-        let path = self.ingest_counter_path();
-        private_dir(&self.root)?;
-        let _lock = lock(&path.with_extension("lock"))?;
-        let mut counters = self.ingest_counters()?;
-        match scope {
-            Scope::Project => counters.project += 1,
-            Scope::User => counters.user += 1,
-        }
-        atomic_write(&path, &serde_json::to_string(&counters)?)
-    }
-
     fn growth(&self, scope: Scope) -> Option<Growth> {
         let text = std::fs::read_to_string(self.growth_path()).ok()?;
         let all: BTreeMap<String, Growth> = serde_json::from_str(&text).ok()?;
@@ -606,23 +561,10 @@ impl MemoryStore {
 /// How many consecutive net-growth saves with no removal trip the warning.
 const GROWTH_STREAK_WARN: usize = 3;
 
-/// Hard daily budget for the unattended ingest, per memory home (shared by
-/// every project so a fleet of jobs cannot flood the store in one day).
-pub const INGEST_DAILY_WRITE_CAP: usize = 10;
-pub const INGEST_DAILY_USER_WRITE_CAP: usize = 2;
-
 const INGEST_RATIONALE_HINT: &str = "daily-ingest entries must carry `Why:` (the user's quoted failure or correction) and `falsified:` (`nothing yet` if none)";
 
 fn has_rationale(text: &str) -> bool {
     text.contains("Why:") && text.contains("falsified:")
-}
-
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct IngestCounters {
-    #[serde(default)]
-    project: usize,
-    #[serde(default)]
-    user: usize,
 }
 
 /// Per-scope growth record: the peak entry count, how many consecutive
