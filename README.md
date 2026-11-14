@@ -31,7 +31,8 @@ One binary, four surfaces:
   bare `/memory` status line reports the last run.
 
 - **`prompt/context`** serves the frozen per-session snapshot (the policy
-  line plus non-empty `user`/`decisions` fields as compact JSON). The
+  line plus non-empty `decisions`/`user` fields as `Project:`/`User:`
+  blocks, one capped summary line per entry). The
   freeze is pinned by `session.id` on the wire, so a session replays
   identical bytes on rebuild — the provider prefix-cache stays warm.
 - **`/memory …`** runs over `command/run`: `on|off` flips the plugin's own

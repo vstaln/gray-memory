@@ -7,9 +7,11 @@
 //! are not in its vocabulary. The ingest contract (`Why:`/`falsified:`,
 //! never-overwrite, daily budgets, secret redaction) does the rest.
 //!
-//! Nothing calls this automatically: the `turn_end` ticker was removed —
-//! memory writes happen inline via the `memory` tool. `distill-run` stays
-//! as a manual verb and `gray memory distill-log` tails the log.
+//! One trigger runs it automatically: `compact/before`. Right before the
+//! host compacts a session, [`pre_compact`] captures the transcript tail
+//! that is about to be summarized away and hands it to a detached runner
+//! (the per-turn `turn_end` ticker stays removed). `distill-run` is also a
+//! manual verb and `gray memory distill-log` tails the log.
 //!
 //! Running in a detached subprocess (not a sidecar thread) is deliberate:
 //! a `gray -p` session ends right after its last `turn_end`, and the
@@ -29,6 +31,8 @@ use crate::store::{MemoryStore, Scope};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const TRANSCRIPT_WAIT: Duration = Duration::from_secs(12);
+/// Under the host's `compact/before` request timeout (20s).
+const PRE_COMPACT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const DISTILL_TIMEOUT: Duration = Duration::from_secs(120);
 const INGEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_FAILURES: u32 = 3;
@@ -127,8 +131,109 @@ pub fn last_status_line(home: &Path) -> Option<String> {
     })
 }
 
-pub fn run(home: &Path, sid: &str, cwd: &Path, model: Option<&str>) {
+/// Deletes a captured transcript once the runner is done with it.
+struct RemoveOnDrop<'a>(&'a Path);
+
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+/// `compact/before`: the host is about to summarize this session's history
+/// away. Capture the tail now (synchronously, so the host's compaction
+/// can't race the read), then distill it in a detached runner so the host
+/// isn't held up by a model call.
+pub fn pre_compact(home: &Path, params: &serde_json::Value) -> anyhow::Result<()> {
+    ensure!(!crate::cli::disabled(), "memory disabled (GRAY_NO_MEMORY)");
+    // Recursion guard: a distill worker is itself a `gray -p` session.
+    if std::env::var_os("GRAY_MEMORY_DISTILL").is_some() || !crate::enabled(home) {
+        return Ok(());
+    }
+    let sid = params["session"]["id"].as_str().unwrap_or("");
+    ensure!(
+        crate::valid_session_id(sid) || crate::canonical_uuid(sid).is_some(),
+        "invalid session id {sid:?}"
+    );
+    let cwd = params["session"]["cwd"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut read = Command::new("gray");
+    read.args(["read", sid, "--last", &TRANSCRIPT_LAST.to_string()]);
+    let out = run_capped(&mut read, None, PRE_COMPACT_READ_TIMEOUT)?;
+    ensure!(
+        out.status.is_some_and(|s| s.success()) && !out.stdout.trim().is_empty(),
+        "gray read failed: {}",
+        out.stderr.trim()
+    );
     let root = home.join("memory");
+    let pending = root.join("pending");
+    crate::store::private_dir(&pending)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = pending.join(format!("{sid}.{nanos}.txt"));
+    std::fs::write(&path, out.stdout.as_bytes())?;
+    // Compaction is rare, so the 3-failure stop marker (meant to stop a
+    // per-turn loop) shouldn't silence every later compaction for good.
+    let _ = std::fs::remove_file(root.join("distill.stopped"));
+    let model = std::env::var("GRAY_MEMORY_DISTILL_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty());
+    spawn_runner(home, sid, &cwd, model.as_deref(), &path)
+}
+
+fn spawn_runner(
+    home: &Path,
+    sid: &str,
+    cwd: &Path,
+    model: Option<&str>,
+    transcript: &Path,
+) -> anyhow::Result<()> {
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg("distill-run")
+        .arg("--session")
+        .arg(sid)
+        .arg("--cwd")
+        .arg(cwd)
+        .arg("--transcript")
+        .arg(transcript);
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.join("memory").join("distill.log"))
+    {
+        Ok(f) => cmd.stderr(Stdio::from(f)),
+        Err(_) => cmd.stderr(Stdio::null()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group: a `gray -p` host can exit (and tear down this
+        // sidecar) while the distill is still running.
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().context("spawn distill runner")?;
+    Ok(())
+}
+
+pub fn run(home: &Path, sid: &str, cwd: &Path, model: Option<&str>, transcript: Option<&Path>) {
+    let root = home.join("memory");
+    let _cleanup = transcript.map(RemoveOnDrop);
     if crate::store::private_dir(&root).is_err() || root.join("distill.stopped").exists() {
         return;
     }
@@ -155,7 +260,7 @@ pub fn run(home: &Path, sid: &str, cwd: &Path, model: Option<&str>) {
         now_iso()
     );
 
-    let outcome = distill_once(home, &root, sid, cwd, model);
+    let outcome = distill_once(home, &root, sid, cwd, model, transcript);
     let mut st = read_status(&root);
     st.ts = now_iso();
     st.session = sid.to_string();
@@ -222,8 +327,17 @@ fn distill_once(
     sid: &str,
     cwd: &Path,
     model: Option<&str>,
+    captured: Option<&Path>,
 ) -> anyhow::Result<Summary> {
     ensure!(!crate::cli::disabled(), "memory disabled (GRAY_NO_MEMORY)");
+    if let Some(path) = captured {
+        let transcript = std::fs::read_to_string(path).context("read captured transcript")?;
+        ensure!(
+            !transcript.trim().is_empty(),
+            "captured transcript is empty"
+        );
+        return distill_text(home, root, sid, cwd, model, &transcript);
+    }
     // The transcript can still be flushing when turn_end arrives — a `-p`
     // session is mid-exit — so retry for a few seconds before giving up.
     let deadline = Instant::now() + TRANSCRIPT_WAIT;
@@ -242,6 +356,17 @@ fn distill_once(
             _ => std::thread::sleep(Duration::from_secs(1)),
         }
     };
+    distill_text(home, root, sid, cwd, model, &transcript)
+}
+
+fn distill_text(
+    home: &Path,
+    root: &Path,
+    sid: &str,
+    cwd: &Path,
+    model: Option<&str>,
+    transcript: &str,
+) -> anyhow::Result<Summary> {
     let (project, user) = MemoryStore::new(home, cwd)
         .map(|s| {
             (
@@ -250,7 +375,7 @@ fn distill_once(
             )
         })
         .unwrap_or_default();
-    let prompt = worker_prompt(sid, &project, &user, &transcript);
+    let prompt = worker_prompt(sid, &project, &user, transcript);
 
     // The worker is sandboxed two ways. It runs `--bare --lean` — no
     // plugins, no sidecars, no snapshot — and its GRAY_MEMORY_HOME is a

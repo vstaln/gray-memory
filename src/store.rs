@@ -43,9 +43,10 @@ impl MemoryInjection {
     }
 }
 
-/// First sentence of an entry: cut at the first ". " whose preceding token
-/// is at least 2 characters, so "e.g. ", "i.e. " and "3.5 " never end a
-/// sentence. No truncation: an unbounded value is served whole.
+/// First sentence of an entry, without its " Why:" trailer: cut at the
+/// first ". " whose preceding token is at least 2 characters or absent, so
+/// "e.g. ", "i.e. " and "3.5 " never end a sentence but "(54%). " does.
+/// The result is capped at [`SUMMARY_CHARS`], ending in "…" when cut.
 fn first_sentence(text: &str) -> String {
     let head = match text.find(" Why:") {
         Some(i) => text[..i].trim_end(),
