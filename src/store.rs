@@ -366,27 +366,29 @@ impl MemoryStore {
         Ok(changed)
     }
 
-    /// Daily-ingest reconcile. Append-only by construction: the new text must
-    /// contain the old one verbatim (`as of <date>: <new> (was: <old>)`), so a
-    /// contradiction is recorded, never a silent replacement.
+    /// Daily-ingest reconcile. Append-only by construction: when the new text
+    /// does not already carry the old one, `(was: <old>)` is appended here, so
+    /// a contradiction is recorded, never a silent replacement. A key that is
+    /// not there yet is simply created.
     pub fn ingest_edit(&self, scope: Scope, key: &str, text: &str) -> anyhow::Result<bool> {
         validate_key(key)?;
         validate_text(text)?;
         ensure!(has_rationale(text), INGEST_RATIONALE_HINT);
         let trimmed = text.trim().to_owned();
         let changed = self.change(scope, |entries| {
-            let old = entries
-                .get(key)
-                .with_context(|| format!("no memory entry named '{key}'"))?
-                .clone();
-            ensure!(
-                trimmed.contains(&old),
-                "ingest edits are append-only: keep the previous text verbatim, e.g. `as of <today>: <new> (was: <old>)`"
-            );
+            let Some(old) = entries.get(key).cloned() else {
+                entries.insert(key.to_owned(), trimmed.clone());
+                return Ok(true);
+            };
             if old == trimmed {
                 return Ok(false);
             }
-            entries.insert(key.to_owned(), trimmed.clone());
+            let merged = if trimmed.contains(&old) {
+                trimmed.clone()
+            } else {
+                format!("{trimmed} (was: {old})")
+            };
+            entries.insert(key.to_owned(), merged);
             Ok(true)
         })?;
         Ok(changed)
@@ -416,14 +418,37 @@ impl MemoryStore {
         validate_key(key)?;
         validate_text(text)?;
         let trimmed = text.trim().to_owned();
-        let old = self
-            .get(scope, key)?
-            .with_context(|| format!("no memory entry named '{key}'"))?;
-        if old == trimmed {
-            return Ok(false);
+        let scope = self.scope_holding(scope, key)?.unwrap_or(scope);
+        if let Some(old) = self.get(scope, key)? {
+            if old == trimmed {
+                return Ok(false);
+            }
+            self.append_history(scope, key, &old, "update")?;
         }
-        self.append_history(scope, key, &old, "update")?;
-        self.edit(scope, key, &trimmed)
+        self.upsert(scope, key, &trimmed)
+    }
+
+    fn scope_holding(&self, scope: Scope, key: &str) -> anyhow::Result<Option<Scope>> {
+        let other = match scope {
+            Scope::User => Scope::Project,
+            Scope::Project => Scope::User,
+        };
+        for candidate in [scope, other] {
+            if self.get(candidate, key)?.is_some() {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    fn upsert(&self, scope: Scope, key: &str, text: &str) -> anyhow::Result<bool> {
+        self.change(scope, |entries| {
+            if entries.get(key).is_some_and(|old| old == text) {
+                return Ok(false);
+            }
+            entries.insert(key.to_owned(), text.to_owned());
+            Ok(true)
+        })
     }
 
     pub fn ingest_update(&self, scope: Scope, key: &str, text: &str) -> anyhow::Result<bool> {
@@ -434,6 +459,10 @@ impl MemoryStore {
 
     pub fn remove_logged(&self, scope: Scope, key: &str) -> anyhow::Result<()> {
         validate_key(key)?;
+        let scope = match self.scope_holding(scope, key)? {
+            Some(found) => found,
+            None => anyhow::bail!("no memory entry named '{key}'"),
+        };
         let old = self
             .get(scope, key)?
             .with_context(|| format!("no memory entry named '{key}'"))?;
