@@ -34,8 +34,8 @@ fn manifest() -> serde_json::Value {
         "hooks": ["prompt/context", "compact/before"],
         // `gray memory <tab>` vocabulary for the host's completer.
         "completion": ["list", "show", "set", "edit", "remove", "clear",
-                       "audit", "ingest-set", "ingest-edit", "distill-log",
-                       "on", "off"],
+                       "audit", "history", "restore", "ingest-set",
+                       "ingest-edit", "distill-log", "on", "off"],
     })
 }
 
@@ -140,8 +140,8 @@ fn command_run(home: &Path, params: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// `tool/call`: the `memory` tool — the immediate write lane. Ops land on
-/// `ingest_set`/`ingest_edit` only; the reply never echoes store contents.
+/// `tool/call`: the `memory` tool — the immediate write lane. Updates and
+/// removals log the old text first; the reply never echoes store contents.
 fn tool_call(home: &Path, params: &serde_json::Value) -> serde_json::Value {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     if name != gray_memory::TOOL_NAME {

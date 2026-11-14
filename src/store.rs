@@ -43,6 +43,17 @@ impl MemoryInjection {
     }
 }
 
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct HistoryEntry {
+    pub ts: String,
+    pub scope: String,
+    pub key: String,
+    pub old_text: String,
+    pub op: String,
+    pub session: String,
+}
+
 /// First sentence of an entry, without its " Why:" trailer: cut at the
 /// first ". " whose preceding token is at least 2 characters or absent, so
 /// "e.g. ", "i.e. " and "3.5 " never end a sentence but "(54%). " does.
@@ -401,6 +412,105 @@ impl MemoryStore {
         Ok(())
     }
 
+    pub fn update(&self, scope: Scope, key: &str, text: &str) -> anyhow::Result<bool> {
+        validate_key(key)?;
+        validate_text(text)?;
+        let trimmed = text.trim().to_owned();
+        let old = self
+            .get(scope, key)?
+            .with_context(|| format!("no memory entry named '{key}'"))?;
+        if old == trimmed {
+            return Ok(false);
+        }
+        self.append_history(scope, key, &old, "update")?;
+        self.edit(scope, key, &trimmed)
+    }
+
+    pub fn ingest_update(&self, scope: Scope, key: &str, text: &str) -> anyhow::Result<bool> {
+        validate_text(text)?;
+        ensure!(has_rationale(text), INGEST_RATIONALE_HINT);
+        self.update(scope, key, text)
+    }
+
+    pub fn remove_logged(&self, scope: Scope, key: &str) -> anyhow::Result<()> {
+        validate_key(key)?;
+        let old = self
+            .get(scope, key)?
+            .with_context(|| format!("no memory entry named '{key}'"))?;
+        self.append_history(scope, key, &old, "remove")?;
+        self.remove(scope, key)
+    }
+
+    fn history_path(&self) -> PathBuf {
+        self.root.join("history.jsonl")
+    }
+
+    fn append_history(
+        &self,
+        scope: Scope,
+        key: &str,
+        old_text: &str,
+        op: &str,
+    ) -> anyhow::Result<()> {
+        private_dir(&self.root)?;
+        let path = self.history_path();
+        reject_symlinks(&path)?;
+        let _lock = lock(&path.with_extension("lock"))?;
+        let mut opts = OpenOptions::new();
+        opts.append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&path)?;
+        let line = serde_json::json!({
+            "ts": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "scope": scope_label(scope),
+            "key": key,
+            "old_text": old_text,
+            "op": op,
+            "session": std::env::var("GRAY_SESSION_ID").unwrap_or_default(),
+        });
+        writeln!(file, "{line}")?;
+        Ok(())
+    }
+
+    pub fn history_tail(&self, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
+        let Some(text) = read_text(&self.history_path())? else {
+            return Ok(Vec::new());
+        };
+        let entries: Vec<HistoryEntry> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<HistoryEntry>(line).ok())
+            .collect();
+        let start = entries.len().saturating_sub(limit);
+        Ok(entries[start..].to_vec())
+    }
+
+    pub fn restore(&self, key: &str) -> anyhow::Result<(Scope, String)> {
+        validate_key(key)?;
+        let entry = self
+            .history_tail(usize::MAX)?
+            .into_iter()
+            .rev()
+            .find(|entry| entry.key == key)
+            .with_context(|| format!("no history entry for '{key}'"))?;
+        let scope = match entry.scope.as_str() {
+            "user" => Scope::User,
+            "project" => Scope::Project,
+            other => anyhow::bail!("history entry has unknown scope '{other}'"),
+        };
+        let text = entry.old_text;
+        validate_text(&text)?;
+        self.change(scope, |entries| {
+            entries.insert(key.to_owned(), text.clone());
+            Ok(true)
+        })?;
+        Ok((scope, text))
+    }
+
     fn change(
         &self,
         scope: Scope,
@@ -576,7 +686,7 @@ struct Growth {
     removals: usize,
 }
 
-fn scope_label(scope: Scope) -> &'static str {
+pub(crate) fn scope_label(scope: Scope) -> &'static str {
     match scope {
         Scope::User => "user",
         Scope::Project => "project",
