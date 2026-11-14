@@ -310,12 +310,11 @@ fn distill_once(
         match run_capped(&mut ingest, None, INGEST_TIMEOUT) {
             Ok(o) if o.status.is_some_and(|s| s.success()) => sum.added += 1,
             Ok(o) => {
-                // Contract refusals (existing key, dup text, daily cap)
+                // Contract refusals (existing key, dup text)
                 // are skips, not failures — the store did its job.
                 let msg = format!("{}{}", o.stdout, o.stderr);
                 if msg.contains("exists")
                     || msg.contains("already stored")
-                    || msg.contains("cap reached")
                     || msg.contains("unchanged")
                 {
                     sum.skipped += 1;
@@ -369,10 +368,12 @@ fn worker_prompt(sid: &str, project: &str, user: &str, transcript: &str) -> Stri
         "You are the memory distiller for the gray agent harness (session {sid}). \
 Decide what from this transcript tail is worth remembering across future sessions.\n\
 \n\
-SAVE only durable facts: user preferences, confirmed project decisions, corrections \
-of earlier decisions, stable environment or workflow facts. Do NOT save: transient \
-task progress, TODOs, plans, file contents, anything already in memory, or secrets, \
-credentials or tokens (they are refused anyway).\n\
+SAVE only what will still matter weeks from now and can't be read from the code, files \
+or git history: lasting user preferences, corrections to how the agent works, confirmed \
+decisions that change future work. Do NOT save: task progress or status, versions, paths, \
+one-off fixes, TODOs, plans, file contents, anything already in memory (extend that entry \
+instead), or secrets, credentials or tokens (they are refused anyway). Most transcripts \
+hold nothing worth saving; when unsure, save nothing.\n\
 \n\
 MEMORY — project scope (this repo):\n\
 {}\n\

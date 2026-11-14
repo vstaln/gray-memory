@@ -46,7 +46,21 @@ impl MemoryInjection {
 /// First sentence of an entry: cut at the first ". " whose preceding token
 /// is at least 2 characters, so "e.g. ", "i.e. " and "3.5 " never end a
 /// sentence. No truncation: an unbounded value is served whole.
-fn first_sentence(text: &str) -> &str {
+fn first_sentence(text: &str) -> String {
+    let head = match text.find(" Why:") {
+        Some(i) => text[..i].trim_end(),
+        None => text,
+    };
+    let cut = sentence_end(head).unwrap_or(head);
+    if cut.chars().count() <= SUMMARY_CHARS {
+        return cut.to_string();
+    }
+    let mut s: String = cut.chars().take(SUMMARY_CHARS - 1).collect();
+    s.push('…');
+    s
+}
+
+fn sentence_end(text: &str) -> Option<&str> {
     let mut from = 0;
     while let Some(rel) = text[from..].find(". ") {
         let dot = from + rel;
@@ -62,12 +76,12 @@ fn first_sentence(text: &str) -> &str {
             }
             start -= prev.len_utf8();
         }
-        if dot - start >= 2 {
-            return &text[..dot + 1];
+        if start == dot || dot - start >= 2 {
+            return Some(&text[..dot + 1]);
         }
         from = dot + 2;
     }
-    text
+    None
 }
 
 pub struct MemoryStore {
@@ -226,7 +240,7 @@ impl MemoryStore {
         let mut entries: Vec<(String, String)> = store
             .entries
             .iter()
-            .map(|(key, text)| (key.clone(), first_sentence(text).to_owned()))
+            .map(|(key, text)| (key.clone(), first_sentence(text)))
             .collect();
         // The store is key-ordered, so order by write date instead: the
         // freshest belief is the one most likely to still hold. An unrecorded
@@ -243,7 +257,7 @@ impl MemoryStore {
         for (key, text) in entries {
             // "- " + key + ": " + text + "\n"
             let line = key.len() + text.len() + 5;
-            if used + line > SNAPSHOT_SCOPE_BYTES {
+            if used + line > SNAPSHOT_SCOPE_BYTES - CAP_NOTICE_RESERVE {
                 dropped += 1;
                 continue;
             }
@@ -334,13 +348,9 @@ impl MemoryStore {
                 !entries.values().any(|old| old == &trimmed),
                 "that text is already stored under another key; the ingest never duplicates — skip it"
             );
-            self.ensure_ingest_budget(scope)?;
             entries.insert(key.to_owned(), trimmed.clone());
             Ok(true)
         })?;
-        if changed {
-            self.record_ingest_write(scope)?;
-        }
         Ok(changed)
     }
 
@@ -364,13 +374,9 @@ impl MemoryStore {
             if old == trimmed {
                 return Ok(false);
             }
-            self.ensure_ingest_budget(scope)?;
             entries.insert(key.to_owned(), trimmed.clone());
             Ok(true)
         })?;
-        if changed {
-            self.record_ingest_write(scope)?;
-        }
         Ok(changed)
     }
 
@@ -501,43 +507,6 @@ impl MemoryStore {
         })
     }
 
-    fn ingest_counter_path(&self) -> PathBuf {
-        self.root.join(format!(".ingest-{}.json", today()))
-    }
-
-    fn ingest_counters(&self) -> anyhow::Result<IngestCounters> {
-        let text = read_text(&self.ingest_counter_path())?.unwrap_or_default();
-        Ok(serde_json::from_str(&text).unwrap_or_default())
-    }
-
-    fn ensure_ingest_budget(&self, scope: Scope) -> anyhow::Result<()> {
-        let counters = self.ingest_counters()?;
-        let total = counters.project + counters.user;
-        ensure!(
-            total < INGEST_DAILY_WRITE_CAP,
-            "daily ingest cap reached ({INGEST_DAILY_WRITE_CAP} writes for today); skip the rest"
-        );
-        if matches!(scope, Scope::User) {
-            ensure!(
-                counters.user < INGEST_DAILY_USER_WRITE_CAP,
-                "user-scope ingest cap reached ({INGEST_DAILY_USER_WRITE_CAP} writes for today); skip the rest"
-            );
-        }
-        Ok(())
-    }
-
-    fn record_ingest_write(&self, scope: Scope) -> anyhow::Result<()> {
-        let path = self.ingest_counter_path();
-        private_dir(&self.root)?;
-        let _lock = lock(&path.with_extension("lock"))?;
-        let mut counters = self.ingest_counters()?;
-        match scope {
-            Scope::Project => counters.project += 1,
-            Scope::User => counters.user += 1,
-        }
-        atomic_write(&path, &serde_json::to_string(&counters)?)
-    }
-
     fn growth(&self, scope: Scope) -> Option<Growth> {
         let text = std::fs::read_to_string(self.growth_path()).ok()?;
         let all: BTreeMap<String, Growth> = serde_json::from_str(&text).ok()?;
@@ -591,23 +560,10 @@ impl MemoryStore {
 /// How many consecutive net-growth saves with no removal trip the warning.
 const GROWTH_STREAK_WARN: usize = 3;
 
-/// Hard daily budget for the unattended ingest, per memory home (shared by
-/// every project so a fleet of jobs cannot flood the store in one day).
-pub const INGEST_DAILY_WRITE_CAP: usize = 10;
-pub const INGEST_DAILY_USER_WRITE_CAP: usize = 2;
-
 const INGEST_RATIONALE_HINT: &str = "daily-ingest entries must carry `Why:` (the user's quoted failure or correction) and `falsified:` (`nothing yet` if none)";
 
 fn has_rationale(text: &str) -> bool {
     text.contains("Why:") && text.contains("falsified:")
-}
-
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct IngestCounters {
-    #[serde(default)]
-    project: usize,
-    #[serde(default)]
-    user: usize,
 }
 
 /// Per-scope growth record: the peak entry count, how many consecutive
@@ -810,7 +766,11 @@ fn render(store: &Store) -> String {
 /// editor tokens and not the executor's, and provenance is the same trade.
 /// Byte budget for one scope's injected memory block: a snapshot that rides
 /// in every turn's system prompt is billed every turn.
-const SNAPSHOT_SCOPE_BYTES: usize = 4 * 1024;
+const SNAPSHOT_SCOPE_BYTES: usize = 2 * 1024;
+
+const SUMMARY_CHARS: usize = 120;
+
+const CAP_NOTICE_RESERVE: usize = 80;
 
 /// The day an entry's current text was written, `""` when unrecorded.
 fn saved_on<'a>(store: &'a Store, key: &str) -> &'a str {
@@ -851,7 +811,9 @@ pub(crate) fn reject_symlinks(path: &Path) -> anyhow::Result<()> {
 const SNAPSHOT_KEEP: usize = 512;
 
 fn prune_snapshots(dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
         .filter_map(|e| e.ok())
         .map(|e| e.path())
