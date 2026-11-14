@@ -30,12 +30,26 @@ fn manifest() -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": gray_memory::PROTOCOL,
         "tools": [gray_memory::tool_definition()],
+        "description": "curated notes shared across sessions",
         "commands": gray_memory::COMMANDS,
+        "command_descriptions": {"/memory": "curated notes shared across sessions"},
         "hooks": ["prompt/context", "compact/before"],
-        // `gray memory <tab>` vocabulary for the host's completer.
-        "completion": ["list", "show", "set", "edit", "remove", "clear",
-                       "audit", "history", "restore", "ingest-set",
-                       "ingest-edit", "distill-log", "on", "off"],
+        "completion": [
+            {"arg": "list", "description": "list memory entries"},
+            {"arg": "show", "description": "print one entry in full"},
+            {"arg": "set", "description": "add an entry"},
+            {"arg": "edit", "description": "rewrite an entry"},
+            {"arg": "remove", "description": "delete an entry"},
+            {"arg": "clear", "description": "delete every entry"},
+            {"arg": "audit", "description": "check entries against the code"},
+            {"arg": "history", "description": "every change made to an entry"},
+            {"arg": "restore", "description": "bring back a removed entry"},
+            {"arg": "ingest-set", "description": "import notes from another assistant"},
+            {"arg": "ingest-edit", "description": "import and edit an entry"},
+            {"arg": "distill-log", "description": "mint entries from today's log"},
+            {"arg": "on", "description": "inject memory into every turn"},
+            {"arg": "off", "description": "stop injecting memory"},
+        ],
     })
 }
 
