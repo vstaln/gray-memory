@@ -25,7 +25,11 @@ pub struct MemoryArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum MemoryCommand {
     /// Show the current curated entries
-    List,
+    List {
+        /// Include entries marked stale by `review`
+        #[arg(long)]
+        all: bool,
+    },
     /// Show one entry
     Show { key: String },
     /// Add or replace a named entry (one line; never credentials)
@@ -38,6 +42,15 @@ pub enum MemoryCommand {
     Clear,
     /// Review entries against the keep/delete rule (advisory; deletes nothing)
     Audit,
+    /// Mark entries unused for 30 days or pointing at missing paths stale (drops them from the index; deletes nothing)
+    Review {
+        /// List candidates without marking them
+        #[arg(long)]
+        dry_run: bool,
+        /// Clear the stale mark on KEY
+        #[arg(long, value_name = "KEY")]
+        keep: Option<String>,
+    },
     /// Daily-ingest add: refuses an existing key (the ingest never overwrites)
     IngestSet { key: String, text: String },
     /// Daily-ingest reconcile: the new text must keep the old one verbatim
@@ -92,11 +105,11 @@ pub fn run_at(
     let store = MemoryStore::new(home, cwd)?;
     let mut out = String::new();
     match &args.command {
-        MemoryCommand::List => {
+        MemoryCommand::List { all } => {
             let text = if args.verbose {
                 store.list_detailed(args.scope)?
             } else {
-                store.list(args.scope)?
+                store.list_filtered(args.scope, *all)?
             };
             if text.trim().is_empty() {
                 out.push_str("No memories.\n");
@@ -104,8 +117,8 @@ pub fn run_at(
                 out.push_str(&text);
             }
         }
-        MemoryCommand::Show { key } => match store.get(args.scope, key)? {
-            Some(text) => out.push_str(&format!("- {key}: {text}\n")),
+        MemoryCommand::Show { key } => match store.show(args.scope, key)? {
+            Some((_, text)) => out.push_str(&format!("- {key}: {text}\n")),
             None => out.push_str(&format!("No entry named '{key}'.\n")),
         },
         MemoryCommand::Set { key, text } => {
@@ -148,6 +161,9 @@ pub fn run_at(
         }
         MemoryCommand::Audit => {
             out.push_str(&store.audit(args.scope)?);
+        }
+        MemoryCommand::Review { dry_run, keep } => {
+            out.push_str(&store.review(!dry_run, keep.as_deref())?);
         }
         MemoryCommand::IngestSet { key, text } => {
             ensure!(!disabled(), "memory saving disabled by GRAY_NO_MEMORY");

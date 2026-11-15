@@ -30,11 +30,18 @@ One binary, four surfaces:
   tool). `gray memory distill-log` tails `<home>/memory/distill.log`; the
   bare `/memory` status line reports the last run.
 
-- **`prompt/context`** serves the frozen per-session snapshot (the policy
-  line plus non-empty `decisions`/`user` fields as `Project:`/`User:`
-  blocks, one capped summary line per entry). The
-  freeze is pinned by `session.id` on the wire, so a session replays
-  identical bytes on rebuild — the provider prefix-cache stays warm.
+- **`prompt/context`** serves an index, not the entries: one `key: hint`
+  line (about 8 words) per entry, ranked by relevance to the session's
+  project and then by recency, capped at 1 KiB per scope. Full text is one
+  `show` away (the `memory` tool or `gray memory show KEY`). The full index
+  goes out once per session; the host drops repeats, so later turns cost
+  nothing. When entries change mid-session, only a numbered delta
+  (`+` added, `~` edited, `-` removed) is appended, so the cached prefix
+  stays intact. A new `compaction_boundary` in the session transcript
+  triggers a fresh full index.
+- **`memory` tool** ops, in the order to prefer them: `remove`, `update`,
+  `add`, `show`. `add` refuses when entries with overlapping keys or words
+  exist and lists them (`force: true` adds anyway).
 - **`/memory …`** runs over `command/run`: `on|off` flips the plugin's own
   marker (`<home>/memory/enabled`, seeded once from the legacy
   `memory_auto` config key); bare reports state; everything else is the
@@ -44,15 +51,18 @@ One binary, four surfaces:
 
 ```sh
 gray memory [--scope user] set KEY TEXT   # add or replace an entry
-gray memory list [--verbose]              # curated entries (+ provenance)
+gray memory list [--all] [--verbose]      # curated entries (--all: include stale)
 gray memory show KEY / edit KEY TEXT / remove KEY / clear
 gray memory audit                         # advisory; deletes nothing
+gray memory review [--dry-run]            # mark unused (30 days) or broken-path entries stale
+gray memory review --keep KEY             # clear a stale mark
 gray memory ingest-set / ingest-edit      # the daily-ingest contract
 ```
 
 The store is `~/.gray/memory/` — `user.md` plus one `project-<hash>.md`
 per repo (git root), with `<!-- gray:saved=…;source=… -->` provenance
-trailers the model never sees, `snapshots/<session>.json` freeze files,
+trailers the model never sees, `snapshots/<session>.json` per-session
+index state, `meta.json` (last use and stale marks),
 and `GRAY_NO_MEMORY=1` as the hard save kill-switch.
 
 ## Install

@@ -42,6 +42,7 @@ fn manifest() -> serde_json::Value {
             {"arg": "remove", "description": "delete an entry"},
             {"arg": "clear", "description": "delete every entry"},
             {"arg": "audit", "description": "check entries against the code"},
+            {"arg": "review", "description": "mark unused or broken entries stale"},
             {"arg": "history", "description": "every change made to an entry"},
             {"arg": "restore", "description": "bring back a removed entry"},
             {"arg": "ingest-set", "description": "import notes from another assistant"},
@@ -71,15 +72,22 @@ fn prompt_context(home: &Path, params: &serde_json::Value) -> serde_json::Value 
     } else {
         Path::new(cwd).to_path_buf()
     };
+    let transcript = (!session.is_empty() && gray_memory::valid_session_id(session))
+        .then(gray_memory::sessions_dir)
+        .flatten()
+        .map(|d| d.join(format!("{session}.jsonl")));
     let snapshot = MemoryStore::new(home, &cwd).and_then(|store| {
-        store.snapshot(if session.is_empty() {
-            None
-        } else {
-            Some(session)
-        })
+        store.serve(
+            if session.is_empty() {
+                None
+            } else {
+                Some(session)
+            },
+            transcript.as_deref(),
+        )
     });
     match snapshot {
-        Ok(text) => serde_json::json!({ "text": gray_memory::served_text(&text) }),
+        Ok(served) => serde_json::json!({ "text": gray_memory::served_text(&served) }),
         // Never fail a turn over memory: serve nothing and let the next turn
         // retry. stderr is the sidecar's log channel — say why.
         Err(e) => {

@@ -20,29 +20,6 @@ pub enum Scope {
     Project,
 }
 
-/// What lands in the system prompt's memory block. `Summary` injects one
-/// sentence per entry (full text via `gray memory show KEY`); `Full`
-/// restores the pre-2026-09-23 bytes. The snapshot is frozen per durable
-/// session either way, so a mode switch only changes new sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MemoryInjection {
-    #[default]
-    Summary,
-    Full,
-}
-
-impl MemoryInjection {
-    /// Parsed from saved config; unknown values fall back to the default
-    /// rather than failing a user's whole config load.
-    pub fn from_saved(raw: &str) -> Self {
-        if raw.trim().eq_ignore_ascii_case("full") {
-            Self::Full
-        } else {
-            Self::default()
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct HistoryEntry {
@@ -99,6 +76,7 @@ fn sentence_end(text: &str) -> Option<&str> {
 pub struct MemoryStore {
     root: PathBuf,
     project: String,
+    terms: Vec<String>,
 }
 
 impl MemoryStore {
@@ -111,9 +89,11 @@ impl MemoryStore {
             "{:x}",
             Sha256::digest(project_root.as_os_str().as_encoded_bytes())
         );
+        let terms = project_terms(&project_root);
         Ok(Self {
             root: home.join("memory"),
             project,
+            terms,
         })
     }
 
@@ -153,40 +133,21 @@ impl MemoryStore {
         Ok(self.read_store(scope)?.entries.into_iter().collect())
     }
 
-    /// Freeze curated data, not instructions, once per durable session. A new
-    /// process rebuilding the same session gets identical bytes. Anonymous
-    /// headless runs take a fresh snapshot and leave no snapshot file.
     pub fn snapshot(&self, session: Option<&str>) -> anyhow::Result<String> {
-        self.snapshot_with(session, MemoryInjection::default())
+        Ok(match self.serve(session, None)? {
+            Served::Full(text) | Served::Delta(text) => text,
+        })
     }
 
-    /// [`snapshot`](Self::snapshot) with an explicit injection mode. The
-    /// frozen-on-disk path, project check and read-back validation are
-    /// identical in both modes; only the rendered text differs.
-    pub fn snapshot_with(
+    pub fn serve(
         &self,
         session: Option<&str>,
-        mode: MemoryInjection,
-    ) -> anyhow::Result<String> {
-        let capture = || -> anyhow::Result<String> {
-            let render = |scope| -> anyhow::Result<String> {
-                match mode {
-                    MemoryInjection::Summary => self.profile(scope),
-                    MemoryInjection::Full => self.list(scope),
-                }
-            };
-            Ok(serde_json::to_string(&serde_json::json!({
-                "project": self.project,
-                "user": render(Scope::User)?,
-                "decisions": render(Scope::Project)?,
-            }))?)
-        };
+        transcript: Option<&Path>,
+    ) -> anyhow::Result<Served> {
+        let index = self.current_index()?;
         let Some(id) = session else {
-            return capture();
+            return Ok(Served::Full(index.render()));
         };
-        // Legacy UUID snapshots keep their canonical lowercase form; anything
-        // else must pass the session-id policy (`chiral-xenon-pulsar` ok,
-        // `../escape` rejected).
         let id = match crate::canonical_uuid(id) {
             Some(u) => u,
             None => {
@@ -198,90 +159,300 @@ impl MemoryStore {
         private_dir(&dir)?;
         let path = dir.join(format!("{id}.json"));
         let _lock = lock(&dir.join(format!("{id}.lock")))?;
-        if let Some(text) = read_text(&path)? {
-            let value: serde_json::Value =
-                serde_json::from_str(&text).context("invalid memory snapshot")?;
-            ensure!(
-                value["project"].as_str() == Some(&self.project),
-                "memory snapshot belongs to another project"
-            );
-            for field in ["user", "decisions"] {
-                let content = value[field]
-                    .as_str()
-                    .context("invalid memory snapshot fields")?;
-                // The cap notice is not an entry (no key can start with `(`);
-                // every other line must still parse.
-                let entries: String = content
-                    .lines()
-                    .filter(|l| !l.starts_with(CAP_NOTICE_PREFIX))
-                    .map(|l| format!("{l}\n"))
-                    .collect();
-                parse(&entries)?;
+        let saved: Option<SessionState> = match read_text(&path)? {
+            Some(text) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).context("invalid memory snapshot")?;
+                ensure!(
+                    value["project"].as_str() == Some(&self.project),
+                    "memory snapshot belongs to another project"
+                );
+                serde_json::from_value(value)
+                    .ok()
+                    .filter(|s: &SessionState| s.v == 2)
             }
-            // Return canonical fields only, never arbitrary extra snapshot data.
-            return Ok(serde_json::to_string(&serde_json::json!({
-                "project": self.project,
-                "user": value["user"],
-                "decisions": value["decisions"],
-            }))?);
+            None => None,
+        };
+        let fresh = saved.is_none();
+        let mut state = saved.unwrap_or_default();
+        let (boundaries, offset) = transcript
+            .map(|t| count_compactions(t, state.offset, state.boundaries, fresh))
+            .unwrap_or((state.boundaries, state.offset));
+        let compacted = !fresh && boundaries > state.boundaries;
+        state.boundaries = boundaries;
+        state.offset = offset;
+        let mut current = index.served_map();
+        if !(fresh || compacted) {
+            for (k, h) in &state.served {
+                if !current.contains_key(k) && index.alive.contains(k) {
+                    current.insert(k.clone(), h.clone());
+                }
+            }
         }
-        let text = capture()?;
-        atomic_write(&path, &text)?;
-        prune_snapshots(&dir);
-        Ok(text)
+        let out = if fresh || compacted {
+            state.v = 2;
+            state.project = self.project.clone();
+            state.base = index.render();
+            state.served = current;
+            Served::Full(state.base.clone())
+        } else if state.served == current {
+            Served::Full(state.base.clone())
+        } else {
+            state.seq += 1;
+            let delta = render_delta(state.seq, &state.served, &current);
+            state.served = current;
+            Served::Delta(delta)
+        };
+        atomic_write(&path, &serde_json::to_string(&state)?)?;
+        if fresh {
+            prune_snapshots(&dir);
+        }
+        Ok(out)
     }
 
-    /// Served text: entries only, never the provenance trailers. This is what
-    /// reaches the snapshot and the model.
-    pub fn list(&self, scope: Scope) -> anyhow::Result<String> {
-        Ok(render_served(&self.read_store(scope)?.entries))
+    fn current_index(&self) -> anyhow::Result<Index> {
+        let (project, project_dropped) = self.index(Scope::Project)?;
+        let (user, user_dropped) = self.index(Scope::User)?;
+        let meta = self.read_meta();
+        let mut alive = std::collections::BTreeSet::new();
+        for scope in [Scope::Project, Scope::User] {
+            for key in self.read_store(scope)?.entries.into_keys() {
+                if !meta.stale.contains_key(&self.meta_key(scope, &key)) {
+                    alive.insert(format!("{}/{key}", scope_label(scope)));
+                }
+            }
+        }
+        Ok(Index {
+            project,
+            project_dropped,
+            user,
+            user_dropped,
+            alive,
+        })
     }
 
-    /// Served text reduced to each entry's first sentence, newest first and
-    /// capped at [`SNAPSHOT_SCOPE_BYTES`]. This is what the system prompt
-    /// injects by default; `list` remains the full text behind
-    /// `gray memory list` / `gray memory show KEY`.
-    ///
-    /// The cap is the point: this text rides in every turn's system prompt,
-    /// so a memory that grew without bound was an unbounded bill. Oldest
-    /// entries drop first and the block says how many it dropped — the entry
-    /// the model still needs is one `gray memory list` away, not a silent
-    /// loss.
-    pub fn profile(&self, scope: Scope) -> anyhow::Result<String> {
+    fn index(&self, scope: Scope) -> anyhow::Result<(Vec<(String, String)>, usize)> {
         let store = self.read_store(scope)?;
-        let mut entries: Vec<(String, String)> = store
+        let meta = self.read_meta();
+        let mut rows: Vec<(usize, &str, &String, &String)> = store
             .entries
             .iter()
-            .map(|(key, text)| (key.clone(), first_sentence(text)))
+            .filter(|(k, _)| !meta.stale.contains_key(&self.meta_key(scope, k)))
+            .map(|(k, v)| {
+                let hay = format!("{k} {v}").to_lowercase();
+                let score = self
+                    .terms
+                    .iter()
+                    .filter(|t| hay.contains(t.as_str()))
+                    .count();
+                (score, saved_on(&store, k), k, v)
+            })
             .collect();
-        // The store is key-ordered, so order by write date instead: the
-        // freshest belief is the one most likely to still hold. An unrecorded
-        // date sorts oldest and keys break ties, so one store always renders
-        // the same bytes (the frozen snapshot depends on it).
-        entries.sort_by(|(ka, _), (kb, _)| {
-            saved_on(&store, kb)
-                .cmp(saved_on(&store, ka))
-                .then_with(|| ka.cmp(kb))
+        rows.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(a.1))
+                .then_with(|| a.2.cmp(b.2))
         });
-        let mut out = String::new();
+        let mut kept = Vec::new();
         let mut used = 0;
         let mut dropped = 0;
-        for (key, text) in entries {
-            // "- " + key + ": " + text + "\n"
-            let line = key.len() + text.len() + 5;
+        for (_, _, key, text) in rows {
+            let hint = hint(key, text);
+            let line = key.len() + hint.len() + 5;
             if used + line > SNAPSHOT_SCOPE_BYTES - CAP_NOTICE_RESERVE {
                 dropped += 1;
                 continue;
             }
             used += line;
-            out.push_str(&format!("- {key}: {text}\n"));
+            kept.push((key.clone(), hint));
         }
-        if dropped > 0 {
-            out.push_str(&format!(
-                "{CAP_NOTICE_PREFIX}{dropped} older entries not shown; `gray memory list` prints them all)\n"
-            ));
+        Ok((kept, dropped))
+    }
+
+    pub fn list(&self, scope: Scope) -> anyhow::Result<String> {
+        Ok(render_served(&self.read_store(scope)?.entries))
+    }
+
+    pub fn list_filtered(&self, scope: Scope, all: bool) -> anyhow::Result<String> {
+        let store = self.read_store(scope)?;
+        let meta = self.read_meta();
+        Ok(store
+            .entries
+            .iter()
+            .filter_map(|(k, v)| match meta.stale.get(&self.meta_key(scope, k)) {
+                Some(reason) if all => Some(format!("- {k}: {v} [stale: {reason}]\n")),
+                Some(_) => None,
+                None => Some(format!("- {k}: {v}\n")),
+            })
+            .collect())
+    }
+
+    pub fn profile(&self, scope: Scope) -> anyhow::Result<String> {
+        let (rows, dropped) = self.index(scope)?;
+        Ok(render_rows(&rows, dropped))
+    }
+
+    pub fn show(&self, scope: Scope, key: &str) -> anyhow::Result<Option<(Scope, String)>> {
+        validate_key(key)?;
+        let Some(found) = self.scope_holding(scope, key)? else {
+            return Ok(None);
+        };
+        let text = self.get(found, key)?.unwrap_or_default();
+        let id = self.meta_key(found, key);
+        let _ = self.update_meta(|m| {
+            m.used.insert(id, today());
+        });
+        Ok(Some((found, text)))
+    }
+
+    pub fn similar(&self, key: &str, text: &str) -> Vec<(Scope, String, String)> {
+        let new_keys = key_tokens(key);
+        let mut new_words = content_words(decision_of(text));
+        new_words.extend(new_keys.iter().cloned());
+        let mut hits: Vec<(bool, usize, f64, Scope, String, String)> = Vec::new();
+        for scope in [Scope::Project, Scope::User] {
+            let Ok(store) = self.read_store(scope) else {
+                continue;
+            };
+            for (k, v) in &store.entries {
+                let exact = k == key;
+                let ks = key_tokens(k);
+                let shared_keys = new_keys.intersection(&ks).count();
+                let mut words = content_words(decision_of(v));
+                words.extend(ks);
+                let shared = new_words.intersection(&words).count();
+                let union = new_words.union(&words).count().max(1);
+                let jaccard = shared as f64 / union as f64;
+                if exact || shared_keys >= 2 || (shared >= 2 && jaccard >= 0.3) {
+                    hits.push((exact, shared_keys, jaccard, scope, k.clone(), hint(k, v)));
+                }
+            }
+        }
+        hits.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.total_cmp(&a.2))
+        });
+        hits.into_iter()
+            .take(3)
+            .map(|(_, _, _, s, k, h)| (s, k, h))
+            .collect()
+    }
+
+    pub fn review(&self, mark: bool, keep: Option<&str>) -> anyhow::Result<String> {
+        if let Some(key) = keep {
+            validate_key(key)?;
+            let ids: Vec<String> = [Scope::Project, Scope::User]
+                .into_iter()
+                .map(|s| self.meta_key(s, key))
+                .collect();
+            let mut found = false;
+            self.update_meta(|m| {
+                for id in &ids {
+                    if m.stale.remove(id).is_some() {
+                        found = true;
+                        m.used.insert(id.clone(), today());
+                    }
+                }
+            })?;
+            return Ok(if found {
+                format!("'{key}' kept: back in the index.\n")
+            } else {
+                format!("'{key}' is not marked stale.\n")
+            });
+        }
+        let meta = self.read_meta();
+        let cutoff = (chrono::Local::now() - chrono::Duration::days(UNUSED_DAYS))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut found: Vec<(String, String, String)> = Vec::new();
+        let mut already = 0;
+        for scope in [Scope::Project, Scope::User] {
+            let store = self.read_store(scope)?;
+            for (key, text) in &store.entries {
+                let id = self.meta_key(scope, key);
+                if meta.stale.contains_key(&id) {
+                    already += 1;
+                    continue;
+                }
+                let mut reasons = Vec::new();
+                for p in mentioned_paths(text) {
+                    if !expand_home(&p).exists() {
+                        reasons.push(format!("path missing: {p}"));
+                    }
+                }
+                let saved = saved_on(&store, key);
+                let used = meta.used.get(&id).map(String::as_str).unwrap_or("");
+                let last = saved.max(used);
+                if last < cutoff.as_str() {
+                    reasons.push(if last.is_empty() {
+                        "no recorded use".to_string()
+                    } else {
+                        format!("unused since {last}")
+                    });
+                }
+                if !reasons.is_empty() {
+                    found.push((
+                        id,
+                        format!("{}/{key}", scope_label(scope)),
+                        reasons.join("; "),
+                    ));
+                }
+            }
+        }
+        let mut out = String::new();
+        if found.is_empty() {
+            out.push_str("No new stale entries.\n");
+        } else {
+            for (_, label, reason) in &found {
+                out.push_str(&format!("- {label}: {reason}\n"));
+            }
+            if mark {
+                let stamp = today();
+                self.update_meta(|m| {
+                    for (id, _, reason) in &found {
+                        m.stale.insert(id.clone(), format!("{stamp} {reason}"));
+                    }
+                })?;
+                out.push_str(&format!(
+                    "Marked {} stale: out of the index, still in `gray memory list --all`. Nothing deleted; `gray memory review --keep KEY` brings one back, `gray memory remove KEY` deletes it.\n",
+                    found.len()
+                ));
+            } else {
+                out.push_str("Dry run: nothing marked.\n");
+            }
+        }
+        if already > 0 {
+            out.push_str(&format!("{already} entries were already stale.\n"));
         }
         Ok(out)
+    }
+
+    fn scope_id(&self, scope: Scope) -> String {
+        match scope {
+            Scope::User => "user".to_string(),
+            Scope::Project => format!("project-{}", self.project),
+        }
+    }
+
+    fn meta_key(&self, scope: Scope, key: &str) -> String {
+        format!("{}:{key}", self.scope_id(scope))
+    }
+
+    fn read_meta(&self) -> Meta {
+        read_text(&self.root.join("meta.json"))
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    fn update_meta(&self, f: impl FnOnce(&mut Meta)) -> anyhow::Result<()> {
+        private_dir(&self.root)?;
+        let _lock = lock(&self.root.join("meta.lock"))?;
+        let mut meta = self.read_meta();
+        f(&mut meta);
+        atomic_write(&self.root.join("meta.json"), &serde_json::to_string(&meta)?)
     }
 
     /// CLI view with provenance, so a human can see how old each entry is and
@@ -568,6 +739,14 @@ impl MemoryStore {
                 }
             }
             atomic_write(&path, &render(&store))?;
+            let touched: Vec<String> = before
+                .iter()
+                .filter(|(k, v)| store.entries.get(*k) != Some(*v))
+                .map(|(k, _)| self.meta_key(scope, k))
+                .collect();
+            if self.read_meta().stale.keys().any(|id| touched.contains(id)) {
+                let _ = self.update_meta(|m| m.stale.retain(|id, _| !touched.contains(id)));
+            }
             self.record_growth(
                 scope,
                 store.entries.len(),
@@ -695,6 +874,288 @@ impl MemoryStore {
             let _ = atomic_write(&path, &text);
         }
     }
+}
+
+pub enum Served {
+    Full(String),
+    Delta(String),
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct SessionState {
+    v: u32,
+    project: String,
+    base: String,
+    served: BTreeMap<String, String>,
+    seq: u64,
+    boundaries: u64,
+    offset: u64,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Meta {
+    used: BTreeMap<String, String>,
+    stale: BTreeMap<String, String>,
+}
+
+struct Index {
+    project: Vec<(String, String)>,
+    project_dropped: usize,
+    user: Vec<(String, String)>,
+    user_dropped: usize,
+    alive: std::collections::BTreeSet<String>,
+}
+
+impl Index {
+    fn render(&self) -> String {
+        let mut out = String::new();
+        for (label, rows, dropped) in [
+            ("Project", &self.project, self.project_dropped),
+            ("User", &self.user, self.user_dropped),
+        ] {
+            if rows.is_empty() && dropped == 0 {
+                continue;
+            }
+            out.push_str(&format!("{label}:\n{}", render_rows(rows, dropped)));
+        }
+        out
+    }
+
+    fn served_map(&self) -> BTreeMap<String, String> {
+        self.project
+            .iter()
+            .map(|(k, h)| (format!("project/{k}"), h.clone()))
+            .chain(
+                self.user
+                    .iter()
+                    .map(|(k, h)| (format!("user/{k}"), h.clone())),
+            )
+            .collect()
+    }
+}
+
+fn render_rows(rows: &[(String, String)], dropped: usize) -> String {
+    let mut out: String = rows.iter().map(|(k, h)| format!("- {k}: {h}\n")).collect();
+    if dropped > 0 {
+        out.push_str(&format!(
+            "{CAP_NOTICE_PREFIX}{dropped} older entries not shown; `gray memory list` prints them all)\n"
+        ));
+    }
+    out
+}
+
+fn render_delta(
+    seq: u64,
+    old: &BTreeMap<String, String>,
+    new: &BTreeMap<String, String>,
+) -> String {
+    let name = |k: &str| {
+        k.split_once('/')
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_else(|| k.to_string())
+    };
+    let mut out = format!("Memory changes #{seq} (+ added, ~ edited, - removed):\n");
+    for (k, h) in new {
+        match old.get(k) {
+            None => out.push_str(&format!("+ {}: {h}\n", name(k))),
+            Some(was) if was != h => out.push_str(&format!("~ {}: {h}\n", name(k))),
+            Some(_) => {}
+        }
+    }
+    for k in old.keys().filter(|k| !new.contains_key(*k)) {
+        out.push_str(&format!("- {}\n", name(k)));
+    }
+    out
+}
+
+fn count_compactions(path: &Path, offset: u64, seen: u64, fresh: bool) -> (u64, u64) {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut file) = File::open(path) else {
+        return (seen, offset);
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if fresh {
+        return (0, len);
+    }
+    let (start, base) = if len < offset { (0, 0) } else { (offset, seen) };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (seen, offset);
+    }
+    let mut buf = Vec::new();
+    if file.take(len - start).read_to_end(&mut buf).is_err() {
+        return (seen, offset);
+    }
+    let Some(end) = buf.iter().rposition(|b| *b == b'\n') else {
+        return (base, start);
+    };
+    let needle = b"\"compaction_boundary\"";
+    let found = buf[..end]
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count() as u64;
+    (base + found, start + end as u64 + 1)
+}
+
+const HINT_WORDS: usize = 8;
+
+const UNUSED_DAYS: i64 = 30;
+
+const HINT_CHARS: usize = 64;
+
+fn hint(key: &str, text: &str) -> String {
+    let mut plain = String::new();
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => plain.push(c),
+            _ => {}
+        }
+    }
+    let mut body = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    for mark in [",", ":", ";", "."] {
+        body = body.replace(&format!(" {mark}"), mark);
+    }
+    for prefix in [format!("{key}:"), "Decision:".to_string()] {
+        if let Some(rest) = body.strip_prefix(&prefix) {
+            body = rest.trim_start().to_string();
+        }
+    }
+    let sentence = first_sentence(&body);
+    let words: Vec<&str> = sentence.split_whitespace().collect();
+    let mut out = String::new();
+    let mut cut = false;
+    for (i, w) in words.iter().enumerate() {
+        if i == HINT_WORDS || out.chars().count() + w.chars().count() + 1 > HINT_CHARS {
+            cut = true;
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    if out.is_empty() {
+        out = sentence.chars().take(HINT_CHARS - 1).collect();
+        cut = sentence.chars().count() >= HINT_CHARS;
+    }
+    if cut && !out.ends_with('…') {
+        out.push('…');
+    }
+    out
+}
+
+const STOP_WORDS: &[&str] = &[
+    "that",
+    "this",
+    "with",
+    "from",
+    "when",
+    "what",
+    "never",
+    "always",
+    "only",
+    "into",
+    "than",
+    "then",
+    "they",
+    "them",
+    "their",
+    "have",
+    "been",
+    "were",
+    "will",
+    "just",
+    "like",
+    "also",
+    "each",
+    "every",
+    "does",
+    "should",
+    "because",
+    "about",
+    "after",
+    "before",
+    "which",
+    "there",
+    "here",
+    "user",
+    "stated",
+    "session",
+    "nothing",
+    "falsified",
+    "must",
+    "used",
+    "uses",
+    "over",
+];
+
+fn key_tokens(key: &str) -> std::collections::BTreeSet<String> {
+    key.split(['-', '_'])
+        .map(str::to_lowercase)
+        .filter(|t| t.len() >= 3)
+        .collect()
+}
+
+fn content_words(text: &str) -> std::collections::BTreeSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 4 && !STOP_WORDS.contains(w))
+        .map(str::to_string)
+        .collect()
+}
+
+fn decision_of(text: &str) -> &str {
+    text.split_once(" Why:").map_or(text, |(d, _)| d)
+}
+
+fn mentioned_paths(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|t| {
+            t.trim_start_matches(['(', '[', '{', '"', '\'', '`'])
+                .trim_end_matches([')', ']', '}', '"', '\'', '`', ',', ';', ':', '.', '…'])
+        })
+        .filter(|t| {
+            let rooted = t.starts_with("~/") || (t.starts_with('/') && t[1..].contains('/'));
+            rooted
+                && t.len() > 2
+                && !t.contains("://")
+                && !t.contains(['*', '<', '>', '{', '}', '$', '|'])
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
+const GENERIC_TERMS: &[&str] = &[
+    "home", "users", "content", "src", "code", "projects", "repos", "work", "tmp", "admin",
+];
+
+fn project_terms(root: &Path) -> Vec<String> {
+    let Some(name) = root.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let mut terms: Vec<String> = name
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3 && !GENERIC_TERMS.contains(t))
+        .map(str::to_string)
+        .collect();
+    terms.dedup();
+    terms
 }
 
 /// How many consecutive net-growth saves with no removal trip the warning.
@@ -906,7 +1367,7 @@ fn render(store: &Store) -> String {
 /// editor tokens and not the executor's, and provenance is the same trade.
 /// Byte budget for one scope's injected memory block: a snapshot that rides
 /// in every turn's system prompt is billed every turn.
-const SNAPSHOT_SCOPE_BYTES: usize = 2 * 1024;
+const SNAPSHOT_SCOPE_BYTES: usize = 1024;
 
 const SUMMARY_CHARS: usize = 120;
 
