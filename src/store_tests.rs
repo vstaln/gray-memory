@@ -294,12 +294,15 @@ fn private_modes_and_symlink_rejection() {
 }
 
 #[test]
-fn snapshot_is_frozen_on_rebuild_and_resume_but_new_session_gets_updates() {
+fn snapshot_replays_the_base_and_sends_only_deltas_mid_session() {
     let (_dir, store) = setup();
     store.set(Scope::User, "style", "Short.").unwrap();
     let sid = uuid::Uuid::new_v4().to_string();
     let original = store.snapshot(Some(&sid)).unwrap();
     store.set(Scope::User, "style", "Detailed.").unwrap();
+    let delta = store.snapshot(Some(&sid)).unwrap();
+    assert!(delta.starts_with("Memory changes #1"), "{delta}");
+    assert!(delta.contains("~ style: Detailed."), "{delta}");
     assert_eq!(store.snapshot(Some(&sid)).unwrap(), original);
     let resumed =
         MemoryStore::new(store.root.parent().unwrap(), store.root.parent().unwrap()).unwrap();
@@ -539,17 +542,15 @@ fn injected_snapshot_keeps_the_newest_entries_and_says_what_it_dropped() {
     );
     // A capped snapshot must replay on resume, notice and all.
     let session = uuid::Uuid::new_v4().to_string();
-    let first = store
-        .snapshot_with(Some(&session), MemoryInjection::Summary)
-        .unwrap();
+    let first = store.snapshot(Some(&session)).unwrap();
     let again = store
-        .snapshot_with(Some(&session), MemoryInjection::Summary)
+        .snapshot(Some(&session))
         .expect("a capped snapshot replays");
     assert_eq!(first, again);
 }
 
 #[test]
-fn snapshot_carries_summaries_by_default_and_full_text_on_request() {
+fn snapshot_carries_hints_and_list_keeps_full_text() {
     let (_dir, store) = setup();
     store
         .set(
@@ -558,11 +559,15 @@ fn snapshot_carries_summaries_by_default_and_full_text_on_request() {
             "First bit. Second bit that is long.",
         )
         .unwrap();
-    let summary = store.snapshot_with(None, MemoryInjection::Summary).unwrap();
+    let summary = store.snapshot(None).unwrap();
     assert!(summary.contains("First bit."));
     assert!(!summary.contains("Second bit"));
-    let full = store.snapshot_with(None, MemoryInjection::Full).unwrap();
-    assert!(full.contains("Second bit that is long."));
+    assert!(
+        store
+            .list(Scope::Project)
+            .unwrap()
+            .contains("Second bit that is long.")
+    );
 }
 
 // --- ingest guard: the daily job's verbs physically cannot overwrite,
