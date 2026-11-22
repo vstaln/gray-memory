@@ -158,6 +158,7 @@ pub fn tool_definition() -> serde_json::Value {
     serde_json::json!({
         "name": TOOL_NAME,
         "label": "Memory",
+        "preview": "{op} · {key}\n{text|firstline}",
         "description": "Remove, update, add or show a curated cross-session memory entry. Prefer them in that \
             order: delete an entry that is stale, edit one that partly covers the point, and add only when nothing \
             covers it. `add` lists similar entries instead of saving when any exist (pass force:true to add anyway). \
