@@ -7,10 +7,9 @@
 //! are not in its vocabulary. The ingest contract (`Why:`/`falsified:`,
 //! never-overwrite, daily budgets, secret redaction) does the rest.
 //!
-//! One trigger runs it automatically: `compact/before`. Right before the
-//! host compacts a session, [`pre_compact`] captures the transcript tail
-//! that is about to be summarized away and hands it to a detached runner
-//! (the per-turn `turn_end` ticker stays removed). `distill-run` is also a
+//! It runs automatically every [`TURNS_PER_DISTILL`] turns of a session
+//! ([`on_turn_end`]), so each transcript window it reads is distilled once,
+//! and on `compact/before` ([`pre_compact`]) when a host sends it. `distill-run` is also a
 //! manual verb and `gray memory distill-log` tails the log.
 //!
 //! Running in a detached subprocess (not a sidecar thread) is deliberate:
@@ -40,6 +39,7 @@ const TRANSCRIPT_LAST: usize = 40;
 const PROMPT_MAX_BYTES: usize = 48 * 1024;
 const LOG_MAX_BYTES: u64 = 256 * 1024;
 const MAX_COMMANDS: usize = 8;
+pub const TURNS_PER_DISTILL: u32 = 20;
 
 fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -183,7 +183,44 @@ pub fn pre_compact(home: &Path, params: &serde_json::Value) -> anyhow::Result<()
     let model = std::env::var("GRAY_MEMORY_DISTILL_MODEL")
         .ok()
         .filter(|m| !m.trim().is_empty());
-    spawn_runner(home, sid, &cwd, model.as_deref(), &path)
+    spawn_runner(home, sid, &cwd, model.as_deref(), Some(&path))
+}
+
+pub fn on_turn_end(home: &Path, params: &serde_json::Value) -> anyhow::Result<()> {
+    ensure!(!crate::cli::disabled(), "memory disabled (GRAY_NO_MEMORY)");
+    if std::env::var_os("GRAY_MEMORY_DISTILL").is_some() || !crate::enabled(home) {
+        return Ok(());
+    }
+    let sid = params["session"]["id"]
+        .as_str()
+        .or_else(|| params["session_id"].as_str())
+        .unwrap_or("");
+    ensure!(
+        crate::valid_session_id(sid) || crate::canonical_uuid(sid).is_some(),
+        "invalid session id {sid:?}"
+    );
+    let turns = home.join("memory").join("turns");
+    crate::store::private_dir(&turns)?;
+    let counter = turns.join(sid);
+    let count = std::fs::read_to_string(&counter)
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        + 1;
+    if count < TURNS_PER_DISTILL {
+        std::fs::write(&counter, count.to_string())?;
+        return Ok(());
+    }
+    std::fs::write(&counter, "0")?;
+    let cwd = params["session"]["cwd"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let model = std::env::var("GRAY_MEMORY_DISTILL_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty());
+    spawn_runner(home, sid, &cwd, model.as_deref(), None)
 }
 
 fn spawn_runner(
@@ -191,16 +228,17 @@ fn spawn_runner(
     sid: &str,
     cwd: &Path,
     model: Option<&str>,
-    transcript: &Path,
+    transcript: Option<&Path>,
 ) -> anyhow::Result<()> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("distill-run")
         .arg("--session")
         .arg(sid)
         .arg("--cwd")
-        .arg(cwd)
-        .arg("--transcript")
-        .arg(transcript);
+        .arg(cwd);
+    if let Some(t) = transcript {
+        cmd.arg("--transcript").arg(t);
+    }
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
     }
