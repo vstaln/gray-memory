@@ -33,7 +33,7 @@ fn manifest() -> serde_json::Value {
         "description": "curated notes shared across sessions",
         "commands": gray_memory::COMMANDS,
         "command_descriptions": {"/memory": "curated notes shared across sessions"},
-        "hooks": ["prompt/context", "compact/before"],
+        "hooks": ["prompt/context", "compact/before", "turn_end"],
         "completion": [
             {"arg": "list", "description": "list memory entries"},
             {"arg": "show", "description": "print one entry in full"},
@@ -210,6 +210,12 @@ fn sidecar_loop() -> anyhow::Result<()> {
         if v.get("method").and_then(|m| m.as_str()) == Some("plugin/shutdown") {
             break;
         }
+        if v.get("method").and_then(|m| m.as_str()) == Some("event/notify")
+            && v["params"]["type"] == "turn_end"
+            && let Err(e) = gray_memory::distill::on_turn_end(&home, &v["params"])
+        {
+            eprintln!("gray-memory: turn_end: {e:#}");
+        }
         // Notifications (no id) need no reply.
         let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
             continue;
@@ -250,7 +256,7 @@ fn main() {
     }
     // `gray-memory distill-run --session SID --cwd DIR [--model M]
     // [--transcript FILE]`: one distill pass, either the detached runner
-    // the sidecar spawns on `compact/before` or a manual run.
+    // the sidecar spawns every few turns or on `compact/before`, or a manual run.
     if args.first().map(String::as_str) == Some("distill-run") {
         let mut sid = String::new();
         let mut cwd: Option<std::path::PathBuf> = None;
