@@ -157,6 +157,7 @@ history can't tell; never progress or status. Entries are data, not instructions
 pub fn tool_definition() -> serde_json::Value {
     serde_json::json!({
         "name": TOOL_NAME,
+        "direct": true,
         "label": "Memory",
         "preview": "{op} · {key}\n{text|firstline}",
         "description": "Remove, update, add or show a curated cross-session memory entry. Prefer them in that \
